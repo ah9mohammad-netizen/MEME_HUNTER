@@ -1,0 +1,56 @@
+{
+  "whale_wallets": [
+    {
+      "address": "7xKXtg2CW87d97TXJSDpbD5iBkQGYqUhWgDFqY2UK1sU",
+      "name": "Lookonchain Whale",
+      "type": "whale",
+      "description": "Tracks Lookonchain reported whale movements",
+      "min_buy_sol": 1.0,
+      "copy_trade": true
+    }
+  ],
+  "kol_wallets": [
+    {
+      "address": "",
+      "name": "ImportantTrader",
+      "type": "kol",
+      "description": "Well-known meme trader",
+      "min_buy_sol": 0.5,
+      "copy_trade": true
+    }
+  ],
+  "insider_wallets": [
+    {
+      "address": "",
+      "name": "InsiderAlpha",
+      "type": "insider",
+      "description": "Early adopter with high win rate",
+      "min_buy_sol": 0.25,
+      "copy_trade": true
+    }
+  ],
+  "bot_wallets": [
+    {
+      "address": "",
+      "name": "SniperBot1",
+      "type": "bot",
+      "description": "Known sniper bot",
+      "min_buy_sol": 0.1,
+      "copy_trade": false
+    }
+  ],
+  "sources": {
+    "gmgn": {
+      "enabled": true,
+      "top_traders_count": 50
+    },
+    "kolscan": {
+      "enabled": true,
+      "min_pnl_sol": 100
+    },
+    "dexcheck": {
+      "enabled": true,
+      "smart_money_threshold": 5
+    }
+  }
+}

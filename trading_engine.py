@@ -1,0 +1,434 @@
+"""DCA entry, grid exits, balance guards and durable trade accounting."""
+
+from __future__ import annotations
+
+import logging
+from datetime import datetime
+from typing import Dict, List, Optional, Tuple
+
+from capital_manager import CapitalManager
+from config import config
+from learning import TradeLearner
+from models import DCAOrder, GridLevel, Position, TokenSignal, TokenStatus
+from state_store import StateStore
+
+logger = logging.getLogger(__name__)
+
+
+def result_value(result, key: str, default=0):
+    if isinstance(result, dict):
+        return result.get(key, default)
+    return getattr(result, key, default)
+
+
+def result_ok(result) -> bool:
+    return bool(result_value(result, "success", False))
+
+
+class DCAExecutor:
+    def __init__(self, trading_client, store: StateStore):
+        self.client = trading_client
+        self.store = store
+
+    @staticmethod
+    def _sizes(total: float, entries: int, multiplier: float) -> List[float]:
+        entries = max(1, int(entries))
+        multiplier = max(1.0, float(multiplier))
+        denominator = sum(multiplier ** i for i in range(entries))
+        sizes = [total * (multiplier ** i) / denominator for i in range(entries)]
+        # Correct floating point drift on the last leg.
+        sizes[-1] += total - sum(sizes)
+        return sizes
+
+    def _create_grid_levels(self) -> List[GridLevel]:
+        cfg = config.TRADING
+        count = max(1, int(cfg.grid_levels))
+        sellable_pct = max(0.0, min(100.0, 100.0 - cfg.moon_bag_pct))
+        first_pct = min(25.0, sellable_pct)
+        remaining = sellable_pct - first_pct
+        per_level = remaining / (count - 1) if count > 1 else sellable_pct
+        levels = []
+        for index in range(count):
+            amount = sellable_pct if count == 1 else (first_pct if index == 0 else per_level)
+            levels.append(
+                GridLevel(
+                    level=index + 1,
+                    price_pct_of_entry=cfg.first_tp_pct + cfg.grid_spacing_pct * index,
+                    amount_pct=amount,
+                )
+            )
+        return levels
+
+    async def execute_dca(
+        self, mint: str, symbol: str, entry_price: float, total_sol_budget: float,
+        signal_score: float = 0.0, actors: Optional[List[Dict]] = None,
+    ) -> Optional[Position]:
+        cfg = config.TRADING
+        position = Position(
+            token_mint=mint, token_symbol=symbol, entry_price=entry_price,
+            total_invested_sol=0.0, total_tokens=0.0,
+            status=TokenStatus.DCA_ENTRING, entry_signal_score=signal_score,
+            associated_wallets=[item.get("address", item.get("wallet", "")) for item in (actors or []) if isinstance(item, dict)],
+            actor_evidence=list(actors or []),
+        )
+        sizes = self._sizes(total_sol_budget, cfg.dca_entries, cfg.dca_increment_mult)
+        prices = [entry_price if index == 0 else entry_price * (1 - cfg.dca_spacing_pct / 100 * index)
+                  for index in range(len(sizes))]
+
+        for index, (sol_amount, expected_price) in enumerate(zip(sizes, prices), start=1):
+            order = DCAOrder(
+                order_id=f"dca_{mint[:8]}_{index}_{datetime.now().timestamp()}",
+                leg_number=index, amount_sol=sol_amount, expected_price=expected_price,
+            )
+            try:
+                result = await self.client.execute_buy(
+                    mint=mint, sol_amount=sol_amount, slippage_bps=cfg.max_slippage_bps
+                )
+                if not result_ok(result):
+                    order.status = "failed"
+                    logger.warning("DCA leg %s failed for %s: %s", index, symbol, result_value(result, "error", "unknown"))
+                    position.dca_orders.append(order)
+                    continue
+                tokens = float(result_value(result, "tokens_received", 0) or 0)
+                actual_price = float(result_value(result, "price", 0) or 0) or expected_price
+                order.actual_price = actual_price
+                order.tx_signature = result_value(result, "signature")
+                order.status = "filled"
+                order.filled_at = datetime.now()
+                position.dca_orders.append(order)
+                position.total_invested_sol += sol_amount
+                position.total_tokens += tokens
+                position.remaining_cost_sol += sol_amount
+                self.store.record_trade(
+                    position_mint=mint, symbol=symbol, side="buy", strategy="dca",
+                    reason=f"DCA leg {index}", sol_amount=sol_amount,
+                    token_amount=tokens, price=actual_price,
+                    fee_sol=float(result_value(result, "gas_used", 0) or 0),
+                    tx_signature=result_value(result, "signature"),
+                )
+            except Exception as exc:
+                order.status = "failed"
+                position.dca_orders.append(order)
+                logger.error("DCA leg %s failed for %s: %s", index, symbol, exc)
+
+        if position.total_tokens <= 0 or position.total_invested_sol <= 0:
+            return None
+        position.entry_price = position.total_invested_sol / position.total_tokens
+        position.stop_loss_price = position.entry_price * (1 - cfg.stop_loss_pct / 100)
+        position.grid_levels = self._create_grid_levels()
+        position.grid_initial_tokens = position.total_tokens
+        position.moon_bag_tokens = position.total_tokens * cfg.moon_bag_pct / 100
+        position.peak_price = position.entry_price
+        position.dca_complete = True
+        position.status = TokenStatus.HOLDING
+        return position
+
+    async def add_dca_leg(self, position: Position, additional_sol: float) -> DCAOrder:
+        """Add a manual/emergency DCA leg, subject to the caller's balance guard."""
+        next_leg = len(position.dca_orders) + 1
+        expected = position.entry_price * (1 - config.TRADING.dca_spacing_pct / 100 * next_leg)
+        order = DCAOrder(
+            order_id=f"dca_{position.token_mint[:8]}_{next_leg}_{datetime.now().timestamp()}",
+            leg_number=next_leg, amount_sol=additional_sol, expected_price=expected,
+        )
+        try:
+            result = await self.client.execute_buy(
+                position.token_mint, additional_sol, config.TRADING.max_slippage_bps
+            )
+            if not result_ok(result):
+                order.status = "failed"
+                return order
+            tokens = float(result_value(result, "tokens_received", 0) or 0)
+            order.actual_price = float(result_value(result, "price", 0) or 0) or expected
+            order.tx_signature = result_value(result, "signature")
+            order.status = "filled"
+            order.filled_at = datetime.now()
+            position.dca_orders.append(order)
+            position.total_invested_sol += additional_sol
+            position.remaining_cost_sol += additional_sol
+            position.total_tokens += tokens
+            position.entry_price = position.total_invested_sol / position.total_tokens
+            position.stop_loss_price = position.entry_price * (1 - config.TRADING.stop_loss_pct / 100)
+            self.store.record_trade(
+                position_mint=position.token_mint, symbol=position.token_symbol, side="buy",
+                strategy="dca", reason="manual DCA", sol_amount=additional_sol,
+                token_amount=tokens, price=order.actual_price, tx_signature=order.tx_signature,
+            )
+        except Exception as exc:
+            order.status = "failed"
+            logger.error("Manual DCA failed: %s", exc)
+        return order
+
+
+class GridSeller:
+    def __init__(self, trading_client, store: StateStore):
+        self.client = trading_client
+        self.store = store
+
+    @staticmethod
+    def _apply_sale(position: Position, token_amount: float, sol_received: float) -> float:
+        token_amount = min(max(0.0, token_amount), position.total_tokens)
+        cost = position.entry_price * token_amount
+        position.total_tokens = max(0.0, position.total_tokens - token_amount)
+        position.remaining_cost_sol = max(0.0, position.remaining_cost_sol - cost)
+        pnl = sol_received - cost
+        position.realized_pnl_sol += pnl
+        # The moon bag is a subset of remaining tokens.
+        position.moon_bag_tokens = min(position.moon_bag_tokens, position.total_tokens)
+        return pnl
+
+    async def monitor_and_sell(self, position: Position, current_price: float) -> List[Dict]:
+        if position.status not in (TokenStatus.HOLDING, TokenStatus.GRID_SELLING):
+            return []
+        fills = []
+        initial_tokens = position.grid_initial_tokens or position.total_tokens
+        for level in position.grid_levels:
+            if level.status != "active":
+                continue
+            target = position.entry_price * level.price_pct_of_entry / 100
+            if current_price < target:
+                continue
+            # Sell a percentage of the original position, never the reserved moon bag.
+            token_amount = initial_tokens * level.amount_pct / 100
+            max_sell = max(0.0, position.total_tokens - position.moon_bag_tokens)
+            token_amount = min(token_amount, max_sell)
+            if token_amount <= 0:
+                level.status = "skipped"
+                continue
+            try:
+                result = await self.client.execute_sell(
+                    position.token_mint, token_amount, config.TRADING.max_slippage_bps
+                )
+                if not result_ok(result):
+                    logger.warning("Grid sell failed for %s: %s", position.token_symbol, result_value(result, "error", "unknown"))
+                    continue
+                proceeds = float(result_value(result, "sol_received", 0) or 0)
+                sold_amount = float(result_value(result, "tokens_sold", token_amount) or token_amount)
+                pnl = self._apply_sale(position, sold_amount, proceeds)
+                level.status = "triggered"
+                level.triggered_price = current_price
+                level.triggered_at = datetime.now()
+                position.grid_sold_pct += level.amount_pct
+                self.store.record_trade(
+                    position_mint=position.token_mint, symbol=position.token_symbol, side="sell",
+                    strategy="grid", reason=f"grid level {level.level}", sol_amount=proceeds,
+                    token_amount=sold_amount,
+                    price=float(result_value(result, "price", 0) or current_price),
+                    realized_pnl_sol=pnl, fee_sol=float(result_value(result, "gas_used", 0) or 0),
+                    tx_signature=result_value(result, "signature"),
+                )
+                fills.append({"level": level.level, "proceeds": proceeds, "pnl": pnl})
+            except Exception as exc:
+                logger.error("Grid sell failed for %s: %s", position.token_symbol, exc)
+        position.updated_at = datetime.now()
+        return fills
+
+
+class MomentumDetector:
+    """Minimal local price history used by the position monitor."""
+
+    def __init__(self):
+        self.price_history: Dict[str, List[Tuple[datetime, float]]] = {}
+
+    def record_price(self, mint: str, price: float) -> None:
+        history = self.price_history.setdefault(mint, [])
+        history.append((datetime.now(), price))
+        if len(history) > 100:
+            del history[:-100]
+
+    def detect_pump_signal(self, mint: str) -> Dict:
+        history = self.price_history.get(mint, [])
+        if len(history) < 10:
+            return {"signal": False, "reason": "Insufficient data"}
+        recent = [item[1] for item in history[-5:]]
+        previous = [item[1] for item in history[-10:-5]]
+        old_avg = sum(previous) / len(previous)
+        new_avg = sum(recent) / len(recent)
+        momentum = (new_avg - old_avg) / old_avg if old_avg else 0
+        return {"signal": momentum > 0.05, "strength": min(100, max(0, momentum * 100)), "price_momentum": momentum}
+
+    def detect_local_max(self, mint: str, current_price: float) -> bool:
+        history = self.price_history.get(mint, [])
+        if len(history) < 5:
+            return False
+        recent = [item[1] for item in history[-5:]]
+        return recent[-1] < recent[-2] < recent[-3] and recent[-3] == max(recent)
+
+
+class TradingEngine:
+    def __init__(
+        self,
+        trading_client,
+        capital_manager: Optional[CapitalManager] = None,
+        store: Optional[StateStore] = None,
+        learner: Optional[TradeLearner] = None,
+    ):
+        self.client = trading_client
+        self.store = store or StateStore()
+        self.capital_manager = capital_manager or CapitalManager(trading_client)
+        self.learner = learner or TradeLearner(self.store)
+        self.dca_executor = DCAExecutor(trading_client, self.store)
+        self.grid_seller = GridSeller(trading_client, self.store)
+        self.momentum_detector = MomentumDetector()
+        self.trading_paused = False
+        self.active_positions: Dict[str, Position] = {
+            item.token_mint: item for item in self.store.load_open_positions()
+        }
+
+    async def open_position(self, signal: TokenSignal, sol_budget: Optional[float] = None) -> Optional[Position]:
+        if self.trading_paused:
+            logger.info("New entries paused")
+            return None
+        if len(self.active_positions) >= config.TRADING.max_coins_tracked:
+            logger.warning("Max positions reached")
+            return None
+        if signal.mint in self.active_positions:
+            return None
+        requested = sol_budget if sol_budget is not None else self.capital_manager.position_cap_sol()
+        approved = await self.capital_manager.reserve_for_entry(requested, self.active_positions.values())
+        if approved is None:
+            return None
+        try:
+            current_price = await self.client.get_token_price(signal.mint)
+            actors = []
+            for wallet in signal.kol_wallets:
+                actors.append({"address": wallet, "source": signal.whale_type or "signal"})
+            position = await self.dca_executor.execute_dca(
+                signal.mint, signal.symbol, current_price, approved,
+                signal_score=signal.overall_score, actors=actors,
+            )
+            if position is None:
+                return None
+            self.active_positions[signal.mint] = position
+            self.store.save_position(position)
+            self.capital_manager.update_after_execution(position.total_invested_sol)
+            return position
+        finally:
+            await self.capital_manager.release_reservation(approved)
+
+    def _save(self, position: Position) -> None:
+        position.updated_at = datetime.now()
+        self.store.save_position(position)
+
+    async def add_dca(self, mint: str, amount_sol: float) -> Optional[DCAOrder]:
+        """Manual DCA with the same wallet and per-meme budget guards."""
+        position = self.active_positions.get(mint)
+        if not position:
+            return None
+        remaining_cap = max(0.0, self.capital_manager.position_cap_sol() - position.total_invested_sol)
+        requested = min(float(amount_sol), remaining_cap)
+        if requested < config.TRADING.min_trade_sol:
+            return None
+        approved = await self.capital_manager.reserve_for_entry(requested, self.active_positions.values())
+        if approved is None:
+            return None
+        try:
+            order = await self.dca_executor.add_dca_leg(position, approved)
+            if order.status == "filled":
+                self.capital_manager.update_after_execution(approved)
+                self._save(position)
+            return order
+        finally:
+            await self.capital_manager.release_reservation(approved)
+
+    async def monitor_positions(self, price_data: Dict[str, float]) -> None:
+        for mint, position in list(self.active_positions.items()):
+            current_price = price_data.get(mint)
+            if not current_price or current_price <= 0:
+                continue
+            self.momentum_detector.record_price(mint, current_price)
+            position.peak_price = max(position.peak_price or position.entry_price, current_price)
+            grid_fills = await self.grid_seller.monitor_and_sell(position, current_price)
+            for fill in grid_fills:
+                self.capital_manager.update_after_receipt(fill.get("proceeds", 0))
+            position.unrealized_pnl_sol = current_price * position.total_tokens - position.remaining_cost_sol
+            position.unrealized_pnl_pct = (
+                (current_price / position.entry_price - 1) * 100 if position.entry_price else 0
+            )
+            if position.stop_loss_price and current_price <= position.stop_loss_price:
+                await self._emergency_exit(position, "Stop loss triggered")
+                continue
+            if position.peak_price >= position.entry_price * (1 + config.TRADING.trailing_stop_pct / 100):
+                position.trailing_stop_active = True
+                position.trailing_stop_price = max(
+                    position.trailing_stop_price,
+                    position.peak_price * (1 - config.TRADING.trailing_stop_pct / 100),
+                )
+            if position.trailing_stop_active and current_price <= position.trailing_stop_price:
+                await self._emergency_exit(position, "Trailing stop triggered")
+                continue
+            self._save(position)
+
+    async def _sell_all(self, position: Position, reason: str, slippage_bps: Optional[int] = None) -> bool:
+        if position.total_tokens <= 0:
+            return True
+        result = await self.client.execute_sell(
+            position.token_mint, position.total_tokens,
+            slippage_bps if slippage_bps is not None else config.TRADING.max_slippage_bps,
+        )
+        if not result_ok(result):
+            logger.error("Could not close %s: %s", position.token_symbol, result_value(result, "error", "unknown"))
+            return False
+        amount = float(result_value(result, "tokens_sold", position.total_tokens) or position.total_tokens)
+        proceeds = float(result_value(result, "sol_received", 0) or 0)
+        pnl = GridSeller._apply_sale(position, amount, proceeds)
+        self.store.record_trade(
+            position_mint=position.token_mint, symbol=position.token_symbol, side="sell",
+            strategy="risk_exit", reason=reason, sol_amount=proceeds, token_amount=amount,
+            price=float(result_value(result, "price", 0) or 0), realized_pnl_sol=pnl,
+            fee_sol=float(result_value(result, "gas_used", 0) or 0), tx_signature=result_value(result, "signature"),
+        )
+        self.capital_manager.update_after_receipt(proceeds)
+        return True
+
+    async def _finalize(self, position: Position, reason: str) -> None:
+        position.status = TokenStatus.CLOSED
+        position.moon_bag_tokens = 0
+        self._save(position)
+        self.learner.record_closed_position(position, reason)
+        self.active_positions.pop(position.token_mint, None)
+
+    async def _emergency_exit(self, position: Position, reason: str) -> None:
+        logger.warning("Emergency exit for %s: %s", position.token_symbol, reason)
+        if await self._sell_all(position, reason, 1000):
+            await self._finalize(position, reason)
+
+    async def close_position(self, mint: str, reason: str = "Manual close") -> None:
+        position = self.active_positions.get(mint)
+        if not position:
+            return
+        if await self._sell_all(position, reason):
+            await self._finalize(position, reason)
+
+    def get_portfolio_summary(self) -> Dict:
+        positions = list(self.active_positions.values())
+        capital = self.capital_manager.snapshot(positions)
+        unrealized = sum(item.unrealized_pnl_sol for item in positions)
+        # Closed positions are removed from active_positions, so cumulative
+        # realized PnL must come from the durable sell ledger.
+        stats = self.store.get_trade_stats()
+        realized = stats["realized_pnl_sol"]
+        snapshot = {
+            **capital, "unrealized_pnl_sol": unrealized,
+            "realized_pnl_sol": realized, "total_pnl_sol": realized + unrealized,
+        }
+        self.store.save_snapshot(snapshot)
+        return {
+            **snapshot,
+            "active_positions": len(positions),
+            "total_invested_sol": sum(item.total_invested_sol for item in positions),
+            "total_trades": stats["sell_fills"], "win_rate": stats["win_rate"],
+            "learning": self.learner.summary(),
+            "positions": [
+                {
+                    "mint": item.token_mint, "symbol": item.token_symbol,
+                    "entry": item.entry_price, "current": (
+                        item.entry_price * (1 + item.unrealized_pnl_pct / 100)
+                    ), "pnl_pct": item.unrealized_pnl_pct,
+                    "pnl_sol": item.unrealized_pnl_sol,
+                    "grid_sold_pct": item.grid_sold_pct,
+                    "moon_bag_tokens": item.moon_bag_tokens,
+                }
+                for item in positions
+            ],
+        }

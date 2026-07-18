@@ -1,0 +1,48 @@
+version: '3.8'
+
+services:
+  meme-hunter:
+    build: .
+    container_name: meme_hunter_bot
+    restart: unless-stopped
+
+    # Environment variables
+    environment:
+      - PYTHONUNBUFFERED=1
+      - LOG_LEVEL=INFO
+      - STATE_DB_PATH=/app/data/meme_hunter.sqlite3
+      - AUTO_LEARN_WALLETS=true
+
+    # Volume for persistence
+    volumes:
+      - ./data:/app/data
+      - ./logs:/app/logs
+      - ./config.json:/app/config.json:ro
+
+    # Network for RPC access
+    networks:
+      - default
+
+    # Resource limits
+    deploy:
+      resources:
+        limits:
+          cpus: '1.0'
+          memory: 512M
+
+  # Optional: Redis for caching
+  redis:
+    image: redis:7-alpine
+    container_name: meme_hunter_redis
+    restart: unless-stopped
+    volumes:
+      - redis_data:/data
+    networks:
+      - default
+
+networks:
+  default:
+    name: meme_hunter_network
+
+volumes:
+  redis_data:
