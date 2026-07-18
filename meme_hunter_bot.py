@@ -22,8 +22,9 @@ from risk_analyzer import RiskAnalyzer, WhaleTracker
 from capital_manager import CapitalManager
 from learning import TradeLearner
 from state_store import StateStore
+from wallet_store import WalletStore
 from trading_engine import TradingEngine
-from solana_client import SolanaTradingClient, PumpFunTrader
+from solana_client import SolanaTradingClient, PaperTradingClient, PumpFunTrader
 from whale_data import whale_fetcher, trending_fetcher, get_whale_activity_for_token
 from telegram_bot import init_telegram
 
@@ -46,11 +47,31 @@ class MemeHunterBot:
             Config.load_from_file(config_path)
         self._load_config()
 
-        # Initialize components
-        self.client = SolanaTradingClient(
-            private_key=config.TRADING.wallet_private_key,
-            rpc_endpoint=config.TRADING.rpc_endpoint
-        )
+        # Two independent SQLite files: trade history/signals and wallets.
+        # STATE_DB_PATH remains accepted as a legacy alias for trade history.
+        trade_path = config.TRADING.trade_history_db_path
+        if config.TRADING.state_db_path != "trade_history.db":
+            trade_path = config.TRADING.state_db_path
+        self.store = StateStore(trade_path)
+        self.wallet_store = WalletStore(config.TRADING.wallets_db_path)
+
+        # Paper mode is the default. It uses live public prices for realistic
+        # fills, but never loads a key or broadcasts a transaction.
+        self.paper_mode = bool(config.TRADING.paper_trading)
+        if self.paper_mode:
+            price_client = SolanaTradingClient(
+                private_key=None, rpc_endpoint=config.TRADING.rpc_endpoint
+            )
+            self.client = PaperTradingClient(
+                starting_balance_sol=config.TRADING.paper_starting_balance_sol,
+                price_client=price_client,
+                trade_store=self.store,
+            )
+        else:
+            self.client = SolanaTradingClient(
+                private_key=config.TRADING.wallet_private_key,
+                rpc_endpoint=config.TRADING.rpc_endpoint,
+            )
 
         self.pump_trader = PumpFunTrader(self.client)
         self.scanner = TokenScanner()
@@ -62,19 +83,18 @@ class MemeHunterBot:
                 wallet.min_buy_sol, copy_trade=wallet.copy_trade,
             )
 
-        # Durable state + capital guard.  The engine reloads open positions
-        # from SQLite before the first network request.
-        self.store = StateStore(config.TRADING.state_db_path)
-        # Use the same durable repository for learned wallets even when a JSON
-        # config changed the DB path after module import.
-        whale_fetcher.store = self.store
-        for candidate in self.store.get_wallet_candidates(limit=100):
+        # Load the wallet list from its own durable file.
+        whale_fetcher.store = self.wallet_store
+        for candidate in self.wallet_store.get_wallet_candidates(limit=100):
             whale_fetcher.add_wallet(
-                candidate["address"], candidate.get("name", "Learned actor"),
-                "learned", candidate.get("min_buy_threshold", 0.5), copy_trade=False,
+                candidate["address"], candidate.get("name", "Tracked wallet"),
+                candidate.get("source", "learned"),
+                candidate.get("min_buy_threshold", 0.5), copy_trade=False,
             )
         self.capital_manager = CapitalManager(self.client)
-        self.learner = TradeLearner(self.store, whale_fetcher)
+        self.learner = TradeLearner(
+            self.store, whale_fetcher, wallet_store=self.wallet_store
+        )
         self.trading_engine = TradingEngine(
             self.client, capital_manager=self.capital_manager,
             store=self.store, learner=self.learner,
@@ -120,6 +140,9 @@ class MemeHunterBot:
             "TRAILING_STOP_PCT": ("trailing_stop_pct", float),
             "MOON_BAG_PCT": ("moon_bag_pct", float),
             "LEARNED_WALLET_MIN_PROFIT_SOL": ("learned_wallet_min_profit_sol", float),
+            "TRADE_HISTORY_DB_PATH": ("trade_history_db_path", str),
+            "WALLETS_DB_PATH": ("wallets_db_path", str),
+            "PAPER_STARTING_BALANCE_SOL": ("paper_starting_balance_sol", float),
         }
         for env_name, (attribute, converter) in env_map.items():
             value = os.getenv(env_name)
@@ -132,11 +155,20 @@ class MemeHunterBot:
             cfg.rpc_endpoint = os.getenv("RPC_ENDPOINT")
         if os.getenv("WALLET_PRIVATE_KEY"):
             cfg.wallet_private_key = os.getenv("WALLET_PRIVATE_KEY")
-        if os.getenv("STATE_DB_PATH") or os.getenv("DB_PATH"):
-            cfg.state_db_path = os.getenv("STATE_DB_PATH") or os.getenv("DB_PATH")
+        legacy_trade_path = os.getenv("STATE_DB_PATH") or os.getenv("DB_PATH")
+        if legacy_trade_path:
+            cfg.trade_history_db_path = legacy_trade_path
+            cfg.state_db_path = legacy_trade_path
+        if os.getenv("PAPER_TRADING") is not None:
+            cfg.paper_trading = os.getenv("PAPER_TRADING", "true").lower() in {"1", "true", "yes"}
         if os.getenv("AUTO_LEARN_WALLETS") is not None:
             cfg.auto_learn_wallets = os.getenv("AUTO_LEARN_WALLETS", "true").lower() in {"1", "true", "yes"}
-        logger.info("Configuration loaded from environment variables")
+        logger.info(
+            "Configuration loaded: mode=%s, trade_db=%s, wallet_db=%s",
+            "paper" if cfg.paper_trading else "live",
+            cfg.trade_history_db_path,
+            cfg.wallets_db_path,
+        )
 
     def _signal_handler(self, signum, frame):
         """Handle shutdown signals"""
@@ -178,10 +210,12 @@ class MemeHunterBot:
 
         # Check wallet
         balance = await self.client.get_balance()
-        logger.info(f"Wallet balance: {balance:.4f} SOL")
-
-        if balance < 0.1:
-            logger.warning("Low SOL balance! Ensure you have at least 0.1 SOL for trading")
+        if self.paper_mode:
+            logger.info(f"Paper balance: {balance:.4f} SOL (no live transactions)")
+        else:
+            logger.info(f"Wallet balance: {balance:.4f} SOL")
+            if balance < 0.1:
+                logger.warning("Low SOL balance! Ensure you have at least 0.1 SOL for trading")
 
         # Initialize scanners
         filters = ScanFilters(
@@ -199,7 +233,11 @@ class MemeHunterBot:
         # Set the capital baseline. With a 1 SOL wallet and defaults this
         # permits roughly 0.1 SOL per meme and keeps at least 0.05 SOL free.
         self.capital_manager.set_balance(balance)
-        self.portfolio.starting_balance_sol = balance
+        if self.paper_mode:
+            # Keep the allocation baseline at the configured opening balance,
+            # even after paper profits/losses or a restart.
+            self.capital_manager.reference_balance_sol = config.TRADING.paper_starting_balance_sol
+        self.portfolio.starting_balance_sol = config.TRADING.paper_starting_balance_sol if self.paper_mode else balance
         self.portfolio.current_balance_sol = balance
 
         # Start main loop
@@ -265,6 +303,13 @@ class MemeHunterBot:
             f"   Buy Ratio: {signal.buy_ratio:.1%}\n"
             f"   Score: {signal.overall_score:.1f}"
         )
+        self.store.record_signal(
+            mint=signal.mint, symbol=signal.symbol, name=signal.name,
+            score=signal.overall_score, dev_buy_sol=signal.dev_buy_sol,
+            market_cap_sol=signal.market_cap_sol, liquidity_sol=signal.liquidity_sol,
+            buy_ratio=signal.buy_ratio, unique_wallets=signal.unique_wallets,
+            decision="discovered", reason="initial scanner signal",
+        )
 
         # Skip if score too low or paused
         if self.paused:
@@ -324,6 +369,18 @@ class MemeHunterBot:
                 should_trade = True
             elif signal.is_whale_alert and whale_summary["total_sol"] >= 2:
                 should_trade = True
+
+        decision = "approved" if should_trade else "rejected"
+        self.store.record_signal(
+            mint=signal.mint, symbol=signal.symbol, name=signal.name,
+            score=signal.overall_score, dev_buy_sol=signal.dev_buy_sol,
+            market_cap_sol=signal.market_cap_sol, liquidity_sol=signal.liquidity_sol,
+            buy_ratio=signal.buy_ratio, unique_wallets=signal.unique_wallets,
+            risk_score=risk_report.overall_score,
+            whale_sol=whale_summary.get("total_sol", 0.0), decision=decision,
+            reason=risk_report.get_recommendation(),
+            metadata={"whale_count": whale_summary.get("total_buys", 0)},
+        )
 
         if should_trade:
             logger.info(f"   ✅ APPROVED FOR TRADING")

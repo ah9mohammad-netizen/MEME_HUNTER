@@ -4,9 +4,10 @@
 echo "🚀 Starting MEME HUNTER Bot..."
 echo "================================"
 
-# Check for required environment variables
-if [ -z "$WALLET_PRIVATE_KEY" ]; then
-    echo "❌ ERROR: WALLET_PRIVATE_KEY not set"
+# Paper mode is safe by default. A private key is required only for live mode.
+PAPER_TRADING="${PAPER_TRADING:-true}"
+if [ "$PAPER_TRADING" = "false" ] && [ -z "$WALLET_PRIVATE_KEY" ]; then
+    echo "❌ ERROR: WALLET_PRIVATE_KEY is required when PAPER_TRADING=false"
     exit 1
 fi
 

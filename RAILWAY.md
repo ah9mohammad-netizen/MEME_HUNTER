@@ -19,8 +19,9 @@
 In Railway Dashboard → Variables, add:
 
 ```env
-# REQUIRED
-WALLET_PRIVATE_KEY=your_base58_private_key
+# Paper mode: no private key or live funds are used.
+PAPER_TRADING=true
+PAPER_STARTING_BALANCE_SOL=1.0
 TELEGRAM_BOT_TOKEN=your_bot_token_from_BotFather
 TELEGRAM_CHAT_ID=your_telegram_chat_id
 
@@ -36,24 +37,30 @@ MIN_TRADE_SOL=0.005
 MAX_POSITION_PER_COIN=0.1
 MAX_COINS_TRACKED=10
 
-# Optional
-LOG_LEVEL=INFO
+# Learning and two separate Railway-backed databases
 AUTO_LEARN_WALLETS=true
 LEARNED_WALLET_MIN_PROFIT_SOL=0.01
-# Attach a Railway Volume at /data to persist this SQLite file across deploys.
-STATE_DB_PATH=/data/meme_hunter.sqlite3
+TRADE_HISTORY_DB_PATH=/data/trade_history.db
+WALLETS_DB_PATH=/data/wallets_list.db
+
+# Optional
+LOG_LEVEL=INFO
+
+# For live trading only, change PAPER_TRADING=false and add:
+# WALLET_PRIVATE_KEY=your_base58_private_key
 ```
 
 ### Step 4: Add durable storage (strongly recommended)
-SQLite records fills, positions and learning data. Railway's container filesystem
-is ephemeral, so create a Railway Volume and mount it at `/data`, then set:
+Create the Railway storage requested for this paper-trading run and mount it at
+`/data`. The bot uses two separate SQLite files:
 
-```env
-STATE_DB_PATH=/data/meme_hunter.sqlite3
+```text
+/data/trade_history.db  # signals, fills, positions, P&L and outcomes
+/data/wallets_list.db   # whale/KOL definitions and learned actors
 ```
 
-Without a volume, the bot still manages live balance safely, but a redeploy can
-lose the local history and learned-wallet database.
+Set both variables exactly as shown above. If the files are not on persistent
+storage, a redeploy can lose the paper-trading history and wallet list.
 
 ### Step 5: Deploy
 1. Click "Deploy"
@@ -140,7 +147,7 @@ Risk Check: 5 minute cache
 ```bash
 # Check logs in Railway dashboard
 # Common issues:
-- WALLET_PRIVATE_KEY invalid
+- PAPER_TRADING=false but WALLET_PRIVATE_KEY is missing/invalid
 - TELEGRAM_* variables missing
 ```
 

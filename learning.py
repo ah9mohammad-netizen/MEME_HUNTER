@@ -1,8 +1,9 @@
 """Small, explainable post-trade learning loop.
 
-This is not an unsafe self-modifying model.  It records outcomes and promotes
-wallets seen behind profitable tokens to a *learned candidate* list.  Learned
-wallets remain alert-only/copy-trade-disabled until the operator reviews them.
+This is not an unsafe self-modifying model. It records outcomes in the trade
+history DB and promotes wallets seen behind profitable tokens to a separate
+learned-candidate DB. Learned wallets remain alert-only/copy-trade-disabled
+until the operator reviews them.
 """
 
 from __future__ import annotations
@@ -13,14 +14,21 @@ from typing import Any, Dict, Iterable, List, Optional
 from config import config
 from models import Position
 from state_store import StateStore
+from wallet_store import WalletStore
 
 logger = logging.getLogger(__name__)
 
 
 class TradeLearner:
-    def __init__(self, store: StateStore, wallet_registry=None):
+    def __init__(
+        self,
+        store: StateStore,
+        wallet_registry=None,
+        wallet_store: Optional[WalletStore] = None,
+    ):
         self.store = store
         self.wallet_registry = wallet_registry
+        self.wallet_store = wallet_store or WalletStore()
 
     @staticmethod
     def _actors(position: Position) -> List[Dict[str, Any]]:
@@ -51,7 +59,7 @@ class TradeLearner:
 
         for actor in actors:
             address = actor["address"]
-            self.store.upsert_wallet_candidate(
+            self.wallet_store.upsert_wallet_candidate(
                 address=address,
                 name=actor.get("wallet_name", actor.get("name", f"Learned {address[:8]}")),
                 source="learned",
@@ -77,13 +85,9 @@ class TradeLearner:
                     logger.warning("Could not add learned wallet %s: %s", address[:12], exc)
 
     def confidence_adjustment(self, wallet_addresses: Iterable[str]) -> float:
-        """Return a small evidence-based score adjustment for future signals.
-
-        It only activates after two observations, preventing one lucky trade
-        from deciding the next entry.  The adjustment is intentionally capped.
-        """
+        """Return a small evidence-based score adjustment for future signals."""
         candidates = {
-            item["address"]: item for item in self.store.get_wallet_candidates(limit=500)
+            item["address"]: item for item in self.wallet_store.get_wallet_candidates(limit=500)
         }
         adjustment = 0.0
         for address in set(wallet_addresses):
@@ -95,4 +99,10 @@ class TradeLearner:
         return max(-10.0, min(10.0, adjustment))
 
     def summary(self) -> Dict[str, Any]:
-        return self.store.learning_summary()
+        trade_summary = self.store.learning_summary()
+        wallet_summary = self.wallet_store.learning_summary()
+        return {
+            "closed_tokens": trade_summary.get("closed_tokens", 0),
+            "profitable_tokens": trade_summary.get("profitable_tokens", 0),
+            "learned_wallets": wallet_summary.get("learned_wallets", 0),
+        }

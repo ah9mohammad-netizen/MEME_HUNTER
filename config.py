@@ -54,10 +54,19 @@ class TradingConfig:
     min_unique_wallets: int = 10
     max_top_holder_pct: float = 30.0
 
-    # Persistence/learning
-    state_db_path: str = "meme_hunter.sqlite3"
+    # Persistence/learning. These are deliberately separate files: trade
+    # history is not mixed with the evolving whale/KOL list.
+    trade_history_db_path: str = "trade_history.db"
+    wallets_db_path: str = "wallets_list.db"
+    # Backwards-compatible alias for older deployments.
+    state_db_path: str = "trade_history.db"
     auto_learn_wallets: bool = True
     learned_wallet_min_profit_sol: float = 0.01
+
+    # Paper trading is the safe default until live execution is explicitly
+    # enabled. Paper balance is simulated independently of the wallet.
+    paper_trading: bool = True
+    paper_starting_balance_sol: float = 1.0
 
 
 @dataclass

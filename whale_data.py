@@ -11,7 +11,7 @@ from typing import Any, Dict, List, Optional
 
 import aiohttp
 
-from state_store import StateStore
+from wallet_store import WalletStore
 
 logger = logging.getLogger(__name__)
 
@@ -37,8 +37,8 @@ class WhaleWallet:
 class WhaleDataFetcher:
     """Fetch only the small amount of smart-money data needed by a signal."""
 
-    def __init__(self, store: Optional[StateStore] = None):
-        self.store = store or StateStore()
+    def __init__(self, store: Optional[WalletStore] = None):
+        self.store = store or WalletStore()
         self.whale_wallets: Dict[str, WhaleWallet] = {}
         self._cache: Dict[str, tuple] = {}
         self._request_times: List[float] = []
@@ -54,8 +54,9 @@ class WhaleDataFetcher:
     def _load_learned_wallets(self) -> None:
         try:
             for item in self.store.get_wallet_candidates(limit=100):
+                source = item.get("source", "learned")
                 self.add_wallet(
-                    item["address"], item.get("name", "Learned actor"), "learned",
+                    item["address"], item.get("name", "Learned actor"), source,
                     float(item.get("min_buy_threshold", 0.5)), copy_trade=False,
                 )
         except Exception as exc:
@@ -86,6 +87,11 @@ class WhaleDataFetcher:
         else:
             wallet.name = name or wallet.name
             wallet.min_buy_threshold = float(min_buy_threshold or wallet.min_buy_threshold)
+        self.store.ensure_wallet(
+            address=wallet.address, name=wallet.name, source=wallet.source,
+            wallet_type="learned" if wallet.source == "learned" else wallet.source,
+            min_buy_threshold=wallet.min_buy_threshold,
+        )
         return wallet
 
     def _is_rate_limited(self) -> bool:
@@ -254,7 +260,6 @@ class WhaleDataFetcher:
         self, mint: str, symbol: str, pnl_sol: float, actors: List[Dict]
     ) -> int:
         """Persist actor evidence and add profitable-token actors as alert-only wallets."""
-        self.store.record_token_outcome(mint, symbol, pnl_sol, actors)
         if pnl_sol <= 0:
             return 0
         added = 0

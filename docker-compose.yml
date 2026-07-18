@@ -10,7 +10,10 @@ services:
     environment:
       - PYTHONUNBUFFERED=1
       - LOG_LEVEL=INFO
-      - STATE_DB_PATH=/app/data/meme_hunter.sqlite3
+      - PAPER_TRADING=true
+      - PAPER_STARTING_BALANCE_SOL=1.0
+      - TRADE_HISTORY_DB_PATH=/app/data/trade_history.db
+      - WALLETS_DB_PATH=/app/data/wallets_list.db
       - AUTO_LEARN_WALLETS=true
 
     # Volume for persistence

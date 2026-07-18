@@ -398,6 +398,77 @@ class SolanaTradingClient:
         return []
 
 
+class PaperTradingClient:
+    """Drop-in trading client that never signs or broadcasts transactions."""
+
+    def __init__(self, starting_balance_sol: float = 1.0, price_client=None, trade_store=None):
+        self.starting_balance_sol = float(starting_balance_sol)
+        self.balance_sol = self.starting_balance_sol
+        self.holdings: Dict[str, float] = {}
+        self.price_client = price_client
+        if self.price_client is None:
+            self.price_client = SolanaTradingClient(private_key=None)
+        if trade_store is not None:
+            self.restore_from_store(trade_store)
+
+    def restore_from_store(self, trade_store) -> None:
+        """Reconstruct simulated cash/token balances after a restart."""
+        self.balance_sol = self.starting_balance_sol
+        self.holdings.clear()
+        for row in reversed(trade_store.get_trade_history(limit=1_000_000)):
+            mint = row.get("position_mint", "")
+            side = row.get("side")
+            sol_amount = float(row.get("sol_amount", 0) or 0)
+            token_amount = float(row.get("token_amount", 0) or 0)
+            if side == "buy":
+                self.balance_sol -= sol_amount
+                self.holdings[mint] = self.holdings.get(mint, 0.0) + token_amount
+            elif side == "sell":
+                self.balance_sol += sol_amount
+                self.holdings[mint] = max(0.0, self.holdings.get(mint, 0.0) - token_amount)
+        self.balance_sol = max(0.0, self.balance_sol)
+
+    async def get_balance(self) -> float:
+        return self.balance_sol
+
+    async def get_token_balance(self, mint: str) -> float:
+        return self.holdings.get(mint, 0.0)
+
+    async def get_token_price(self, mint: str) -> float:
+        return await self.price_client.get_token_price(mint)
+
+    async def execute_buy(self, mint: str, sol_amount: float, slippage_bps: int = 500) -> TradeResult:
+        amount = float(sol_amount)
+        if amount <= 0 or amount > self.balance_sol:
+            return TradeResult(success=False, error="Insufficient simulated SOL balance")
+        price = await self.get_token_price(mint)
+        if price <= 0:
+            return TradeResult(success=False, error="No simulated market price available")
+        tokens = amount / price
+        self.balance_sol -= amount
+        self.holdings[mint] = self.holdings.get(mint, 0.0) + tokens
+        return TradeResult(
+            success=True, tokens_received=tokens, price=price, gas_used=0.0,
+            signature=f"paper-buy-{int(datetime.now().timestamp() * 1000000)}",
+        )
+
+    async def execute_sell(self, mint: str, token_amount: float, slippage_bps: int = 500) -> TradeResult:
+        available = self.holdings.get(mint, 0.0)
+        amount = min(float(token_amount), available)
+        if amount <= 0:
+            return TradeResult(success=False, error="Insufficient simulated token balance")
+        price = await self.get_token_price(mint)
+        if price <= 0:
+            return TradeResult(success=False, error="No simulated market price available")
+        proceeds = amount * price
+        self.holdings[mint] = max(0.0, available - amount)
+        self.balance_sol += proceeds
+        return TradeResult(
+            success=True, tokens_sold=amount, sol_received=proceeds, price=price,
+            gas_used=0.0, signature=f"paper-sell-{int(datetime.now().timestamp() * 1000000)}",
+        )
+
+
 class PumpFunTrader:
     """
     Direct trading on Pump.fun

@@ -66,6 +66,25 @@ class StateStore:
                 );
                 CREATE INDEX IF NOT EXISTS idx_trade_events_mint ON trade_events(position_mint);
                 CREATE INDEX IF NOT EXISTS idx_trade_events_created ON trade_events(created_at);
+                CREATE TABLE IF NOT EXISTS signals (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    mint TEXT NOT NULL,
+                    symbol TEXT NOT NULL,
+                    name TEXT NOT NULL,
+                    score REAL NOT NULL DEFAULT 0,
+                    dev_buy_sol REAL NOT NULL DEFAULT 0,
+                    market_cap_sol REAL NOT NULL DEFAULT 0,
+                    liquidity_sol REAL NOT NULL DEFAULT 0,
+                    buy_ratio REAL NOT NULL DEFAULT 0,
+                    unique_wallets INTEGER NOT NULL DEFAULT 0,
+                    risk_score REAL,
+                    whale_sol REAL NOT NULL DEFAULT 0,
+                    decision TEXT NOT NULL,
+                    reason TEXT,
+                    data_json TEXT,
+                    created_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_signals_created ON signals(created_at);
                 CREATE TABLE IF NOT EXISTS portfolio_snapshots (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     wallet_balance_sol REAL NOT NULL,
@@ -83,20 +102,6 @@ class StateStore:
                     profitable INTEGER NOT NULL,
                     actors_json TEXT NOT NULL,
                     closed_at TEXT NOT NULL
-                );
-                CREATE TABLE IF NOT EXISTS wallet_candidates (
-                    address TEXT PRIMARY KEY,
-                    name TEXT NOT NULL,
-                    source TEXT NOT NULL,
-                    wallet_type TEXT NOT NULL,
-                    min_buy_threshold REAL NOT NULL DEFAULT 0.5,
-                    observations INTEGER NOT NULL DEFAULT 0,
-                    profitable_observations INTEGER NOT NULL DEFAULT 0,
-                    total_pnl_sol REAL NOT NULL DEFAULT 0,
-                    last_token_mint TEXT,
-                    last_seen TEXT,
-                    enabled INTEGER NOT NULL DEFAULT 1,
-                    metadata_json TEXT
                 );
                 """
             )
@@ -139,6 +144,47 @@ class StateStore:
             except Exception as exc:
                 logger.error("Ignoring invalid persisted position: %s", exc)
         return positions
+
+    def record_signal(
+        self,
+        *,
+        mint: str,
+        symbol: str,
+        name: str,
+        score: float,
+        dev_buy_sol: float,
+        market_cap_sol: float,
+        liquidity_sol: float,
+        buy_ratio: float,
+        unique_wallets: int,
+        decision: str,
+        reason: str = "",
+        risk_score: Optional[float] = None,
+        whale_sol: float = 0.0,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> int:
+        """Persist a discovery/evaluation signal for later strategy analysis."""
+        with self._lock, self._connection:
+            cursor = self._connection.execute(
+                """INSERT INTO signals
+                (mint,symbol,name,score,dev_buy_sol,market_cap_sol,liquidity_sol,
+                 buy_ratio,unique_wallets,risk_score,whale_sol,decision,reason,data_json,created_at)
+                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (
+                    mint, symbol, name, float(score), float(dev_buy_sol),
+                    float(market_cap_sol), float(liquidity_sol), float(buy_ratio),
+                    int(unique_wallets), risk_score, float(whale_sol), decision,
+                    reason, json.dumps(metadata or {}, default=self._json_default), self._now(),
+                ),
+            )
+            return int(cursor.lastrowid)
+
+    def get_signal_history(self, limit: int = 100) -> List[Dict[str, Any]]:
+        with self._lock:
+            rows = self._connection.execute(
+                "SELECT * FROM signals ORDER BY id DESC LIMIT ?", (int(limit),)
+            ).fetchall()
+        return [dict(row) for row in rows]
 
     def record_trade(
         self,
@@ -238,62 +284,14 @@ class StateStore:
                 ),
             )
 
-    def upsert_wallet_candidate(
-        self,
-        *,
-        address: str,
-        name: str = "Learned actor",
-        source: str = "learned",
-        wallet_type: str = "learned",
-        min_buy_threshold: float = 0.5,
-        profitable: bool = False,
-        pnl_sol: float = 0.0,
-        token_mint: Optional[str] = None,
-        metadata: Optional[Dict[str, Any]] = None,
-    ) -> None:
-        address = str(address).strip()
-        if not address or len(address) < 32:
-            return
-        with self._lock, self._connection:
-            self._connection.execute(
-                """INSERT INTO wallet_candidates
-                  (address,name,source,wallet_type,min_buy_threshold,observations,
-                   profitable_observations,total_pnl_sol,last_token_mint,last_seen,metadata_json)
-                  VALUES(?,?,?,?,?,1,?,?,?,?,?)
-                  ON CONFLICT(address) DO UPDATE SET name=excluded.name,
-                   observations=wallet_candidates.observations+1,
-                   profitable_observations=wallet_candidates.profitable_observations+excluded.profitable_observations,
-                   total_pnl_sol=wallet_candidates.total_pnl_sol+excluded.total_pnl_sol,
-                   last_token_mint=excluded.last_token_mint,last_seen=excluded.last_seen,
-                   metadata_json=excluded.metadata_json""",
-                (
-                    address, name, source, wallet_type, float(min_buy_threshold),
-                    int(profitable), float(pnl_sol), token_mint, self._now(),
-                    json.dumps(metadata or {}, default=self._json_default),
-                ),
-            )
-
-    def get_wallet_candidates(self, limit: int = 100) -> List[Dict[str, Any]]:
-        with self._lock:
-            rows = self._connection.execute(
-                """SELECT * FROM wallet_candidates WHERE enabled=1
-                   ORDER BY profitable_observations DESC,total_pnl_sol DESC LIMIT ?""",
-                (int(limit),),
-            ).fetchall()
-        return [dict(row) for row in rows]
-
     def learning_summary(self) -> Dict[str, Any]:
         with self._lock:
             outcome = self._connection.execute(
                 "SELECT COUNT(*) AS tokens, COALESCE(SUM(profitable),0) AS profitable FROM token_outcomes"
             ).fetchone()
-            wallets = self._connection.execute(
-                "SELECT COUNT(*) AS candidates FROM wallet_candidates WHERE enabled=1"
-            ).fetchone()
         return {
             "closed_tokens": int(outcome["tokens"] or 0),
             "profitable_tokens": int(outcome["profitable"] or 0),
-            "learned_wallets": int(wallets["candidates"] or 0),
         }
 
     def close(self) -> None:

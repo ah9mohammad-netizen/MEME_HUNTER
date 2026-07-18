@@ -39,6 +39,7 @@ class TelegramBot:
             "/close": self.cmd_close,
             "/dca": self.cmd_dca,
             "/history": self.cmd_history,
+            "/signals": self.cmd_signals,
             "/learning": self.cmd_learning,
             "/stop": self.cmd_stop,
             "/resume": self.cmd_resume,
@@ -174,6 +175,7 @@ class TelegramBot:
 /stop - Pause trading
 
 *Records:*
+/signals - Recent scanner signals
 /history - Recent fills saved in SQLite
 /learning - Learned wallet/token statistics
 /resume - Resume trading
@@ -198,6 +200,7 @@ class TelegramBot:
         status = f"""
 *📊 PORTFOLIO STATUS*
 
+Mode: `{type(self.trading_engine.client).__name__}`
 💰 Wallet SOL: `{summary['wallet_balance_sol']:.4f}`
 🟢 Available for entries: `{summary['available_sol']:.4f} SOL`
 🔒 Committed: `{summary['committed_sol']:.4f} SOL`
@@ -333,6 +336,23 @@ class TelegramBot:
         else:
             await self.send_message("DCA was not placed: balance or per-meme cap would be exceeded.")
 
+    async def cmd_signals(self, args):
+        """Show recent scanner signals saved in the trade-history DB."""
+        if not self.trading_engine:
+            await self.send_message("Trading engine not initialized")
+            return
+        rows = self.trading_engine.store.get_signal_history(limit=10)
+        if not rows:
+            await self.send_message("📭 No signals have been recorded yet.")
+            return
+        lines = ["*🔎 RECENT SIGNALS*"]
+        for row in rows:
+            lines.append(
+                f"• `{row['symbol']}` score `{row['score']:.1f}` — {row['decision']}\n"
+                f"  risk `{row['risk_score'] if row['risk_score'] is not None else 'n/a'}` · {row['created_at']}"
+            )
+        await self.send_message("\n".join(lines))
+
     async def cmd_history(self, args):
         """Show recent persisted fills."""
         if not self.trading_engine:
@@ -358,7 +378,7 @@ class TelegramBot:
             await self.send_message("Trading engine not initialized")
             return
         summary = self.trading_engine.learner.summary()
-        candidates = self.trading_engine.store.get_wallet_candidates(limit=5)
+        candidates = self.trading_engine.learner.wallet_store.get_wallet_candidates(limit=5)
         lines = [
             "*🧠 LEARNING*",
             f"Closed tokens: `{summary['closed_tokens']}`",

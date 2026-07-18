@@ -8,6 +8,11 @@
 
 ## 🎯 Overview
 
+MEME HUNTER currently defaults to **paper trading** with a simulated 1 SOL
+balance. It uses live public market prices for realistic paper fills, but does
+not load a private key or broadcast transactions. Live trading requires an
+explicit `PAPER_TRADING=false` configuration.
+
 MEME HUNTER is a comprehensive trading bot designed to discover high-potential meme coins on Solana and execute sophisticated trading strategies including:
 
 - **🔍 Token Discovery** - Real-time scanning via Pump.fun, DexScreener, and SolanaTracker WebSockets
@@ -68,13 +73,15 @@ balance and the default settings it will:
   `MAX_POSITION_PER_COIN`;
 - cap total open cost basis at `80%` (`0.80 SOL`) and keep `0.05 SOL` as a
   reserve for fees/emergencies;
-- reconcile the wallet balance from Solana RPC every 30 seconds and expose the
-  wallet, committed, reserved and entry-available amounts in Telegram;
+- reconcile the live wallet balance (or simulated paper balance) every 30
+  seconds and expose wallet, committed, reserved and entry-available amounts in Telegram;
 - restore open positions after a process restart.
 
-Every successful DCA leg and sell fill is written to SQLite with token, side,
-strategy, amount, price, reason, fee and transaction signature. Position
-snapshots, portfolio snapshots and token outcomes are also saved. Use
+Every signal, successful DCA leg and sell fill is written to
+`/data/trade_history.db` with token, side, strategy, amount, price, reason, fee
+and transaction/paper signature. Position snapshots, portfolio snapshots and
+token outcomes are also saved. The separate `/data/wallets_list.db` contains
+whale/KOL definitions and learned actors. Use
 `/history` and `/learning` in Telegram.
 
 When a profitable position is closed, wallets associated with that token are
@@ -111,8 +118,12 @@ Create a `config.json` file:
 ```json
 {
   "trading": {
-    "wallet_private_key": "YOUR_PRIVATE_KEY_BASE58",
+    "wallet_private_key": "",
     "rpc_endpoint": "https://api.mainnet-beta.solana.com",
+    "paper_trading": true,
+    "paper_starting_balance_sol": 1.0,
+    "trade_history_db_path": "/data/trade_history.db",
+    "wallets_db_path": "/data/wallets_list.db",
     "allocation_per_meme_pct": 10.0,
     "max_portfolio_allocation_pct": 80.0,
     "min_sol_reserve": 0.05,
@@ -150,8 +161,13 @@ Create a `config.json` file:
 
 Or use environment variables:
 ```bash
-export WALLET_PRIVATE_KEY="your_base58_key"
-export RPC_ENDPOINT="https://api.mainnet-beta.solana.com"
+export PAPER_TRADING=true
+export PAPER_STARTING_BALANCE_SOL=1.0
+export TRADE_HISTORY_DB_PATH=/data/trade_history.db
+export WALLETS_DB_PATH=/data/wallets_list.db
+# Only for live mode:
+# export PAPER_TRADING=false
+# export WALLET_PRIVATE_KEY="your_base58_key"
 ```
 
 ---
@@ -231,7 +247,8 @@ MEME_HUNTER/
 ├── risk_analyzer.py    # Security checks & whale tracking
 ├── trading_engine.py   # DCA, Grid, stops and trade accounting
 ├── capital_manager.py  # Per-meme allocation, reserve and balance guard
-├── state_store.py      # Durable SQLite positions/trades/snapshots
+├── state_store.py      # Trade-history SQLite signals/trades/snapshots
+├── wallet_store.py     # Separate whale/KOL SQLite list
 ├── learning.py         # Explainable profitable-actor learning
 ├── solana_client.py    # Solana DEX interactions
 ├── meme_hunter_bot.py  # Main bot orchestration
