@@ -26,7 +26,12 @@ from wallet_store import WalletStore
 from storage_paths import default_trade_history_path, default_wallets_path
 from trading_engine import TradingEngine
 from solana_client import SolanaTradingClient, PaperTradingClient, PumpFunTrader
-from whale_data import whale_fetcher, trending_fetcher, get_whale_activity_for_token
+from whale_data import (
+    whale_fetcher,
+    trending_fetcher,
+    get_whale_activity_for_token,
+    update_whale_list_from_gmgn,
+)
 from telegram_bot import init_telegram
 
 logger = logging.getLogger(__name__)
@@ -285,7 +290,7 @@ class MemeHunterBot:
                     await asyncio.sleep(1800)
                 first_run = False
                 if not self.paused:
-                    result = await trending_fetcher.update_whale_list_from_gmgn(limit=50)
+                    result = await update_whale_list_from_gmgn(limit=50)
                     logger.info(f"Whale list updated: {result['count']} wallets")
             except Exception as e:
                 logger.error(f"Whale updater error: {e}")
