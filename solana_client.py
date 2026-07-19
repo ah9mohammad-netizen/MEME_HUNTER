@@ -444,11 +444,13 @@ class PaperTradingClient:
         price = await self.get_token_price(mint)
         if price <= 0:
             return TradeResult(success=False, error="No simulated market price available")
-        tokens = amount / price
+        fee = amount * config.TRADING.paper_fee_bps / 10_000
+        execution_price = price * (1 + config.TRADING.paper_slippage_bps / 10_000)
+        tokens = max(0.0, amount - fee) / execution_price
         self.balance_sol -= amount
         self.holdings[mint] = self.holdings.get(mint, 0.0) + tokens
         return TradeResult(
-            success=True, tokens_received=tokens, price=price, gas_used=0.0,
+            success=True, tokens_received=tokens, price=execution_price, gas_used=fee,
             signature=f"paper-buy-{int(datetime.now().timestamp() * 1000000)}",
         )
 
@@ -460,12 +462,15 @@ class PaperTradingClient:
         price = await self.get_token_price(mint)
         if price <= 0:
             return TradeResult(success=False, error="No simulated market price available")
-        proceeds = amount * price
+        execution_price = price * (1 - config.TRADING.paper_slippage_bps / 10_000)
+        gross_proceeds = amount * execution_price
+        fee = gross_proceeds * config.TRADING.paper_fee_bps / 10_000
+        proceeds = max(0.0, gross_proceeds - fee)
         self.holdings[mint] = max(0.0, available - amount)
         self.balance_sol += proceeds
         return TradeResult(
-            success=True, tokens_sold=amount, sol_received=proceeds, price=price,
-            gas_used=0.0, signature=f"paper-sell-{int(datetime.now().timestamp() * 1000000)}",
+            success=True, tokens_sold=amount, sol_received=proceeds, price=execution_price,
+            gas_used=fee, signature=f"paper-sell-{int(datetime.now().timestamp() * 1000000)}",
         )
 
 

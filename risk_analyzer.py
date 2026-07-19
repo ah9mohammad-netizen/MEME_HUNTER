@@ -39,6 +39,14 @@ class RiskReport:
     high_concentration: bool = False
     new_token_unverified: bool = False
 
+    # Data-quality and behavioral warnings
+    checks_complete: bool = False
+    behavior_data_available: bool = False
+    wash_trading_suspected: bool = False
+    bundle_risk_suspected: bool = False
+    mechanical_trading_suspected: bool = False
+    creator_sold_early: bool = False
+
     # Details
     top_holder_pct: float = 0.0
     dev_holding_pct: float = 0.0
@@ -74,6 +82,10 @@ class RiskReport:
             return False
         if self.high_concentration or self.developer_cluster:
             return False
+        if not self.checks_complete:
+            return False
+        if self.wash_trading_suspected or self.bundle_risk_suspected or self.creator_sold_early:
+            return False
         return self.overall_score >= min_score
 
 
@@ -92,7 +104,12 @@ class RiskAnalyzer:
         self._cache: Dict[str, Tuple[RiskReport, datetime]] = {}
         self._cache_ttl = 60  # seconds
 
-    async def analyze(self, mint: str, market_data: Dict = None) -> RiskReport:
+    async def analyze(
+        self,
+        mint: str,
+        market_data: Dict = None,
+        behavior_data: Optional[Dict] = None,
+    ) -> RiskReport:
         """
         Perform comprehensive risk analysis on a token
 
@@ -131,6 +148,8 @@ class RiskAnalyzer:
 
         # Update report
         report.is_honeypot = is_honeypot
+        required_checks = [contract_data, honeypot_data, liquidity_data, holder_data]
+        report.checks_complete = all(bool(item.get("available", False)) for item in required_checks)
         report.has_mint_authority = contract_data.get("has_mint_authority", True)
         report.has_freeze_authority = contract_data.get("has_freeze_authority", True)
 
@@ -141,6 +160,13 @@ class RiskAnalyzer:
         report.dev_holding_pct = holder_data.get("dev_pct", 0)
         report.high_concentration = report.top_holder_pct > 30
         report.developer_cluster = holder_data.get("has_cluster", False)
+
+        behavior = behavior_data or {}
+        report.behavior_data_available = bool(behavior)
+        report.wash_trading_suspected = float(behavior.get("wash_trading_score", 0) or 0) >= 70
+        report.bundle_risk_suspected = float(behavior.get("bundle_risk_score", 0) or 0) >= 85
+        report.mechanical_trading_suspected = float(behavior.get("mechanicality_score", 0) or 0) >= 80
+        report.creator_sold_early = bool(behavior.get("creator_sold", False))
 
         # Calculate scores
         report.contract_score = self._calc_contract_score(contract_data)
@@ -153,6 +179,17 @@ class RiskAnalyzer:
             report.liquidity_score * 0.25 +
             report.holder_score * 0.40
         )
+        if not report.checks_complete:
+            report.overall_score = min(report.overall_score, 25.0)
+        if report.wash_trading_suspected:
+            report.overall_score -= 25.0
+        if report.bundle_risk_suspected:
+            report.overall_score -= 20.0
+        if report.mechanical_trading_suspected:
+            report.overall_score -= 10.0
+        if report.creator_sold_early:
+            report.overall_score -= 20.0
+        report.overall_score = max(0.0, min(100.0, report.overall_score))
 
         # Add warnings
         if report.has_mint_authority:
@@ -167,6 +204,16 @@ class RiskAnalyzer:
             report.warnings.append("⚠️ Developer cluster detected")
         if report.is_honeypot:
             report.warnings.append("🚨 HONEYPOT DETECTED - Cannot sell!")
+        if not report.checks_complete:
+            report.warnings.append("⚠️ Required risk data unavailable - fail closed")
+        if report.wash_trading_suspected:
+            report.warnings.append("⚠️ Wash-trading proxy detected")
+        if report.bundle_risk_suspected:
+            report.warnings.append("⚠️ Coordinated early-wallet proxy detected")
+        if report.mechanical_trading_suspected:
+            report.warnings.append("⚠️ Mechanical/repeated trade pattern detected")
+        if report.creator_sold_early:
+            report.warnings.append("⚠️ Creator wallet sold during observation window")
 
         # Cache result
         self._cache[mint] = (report, datetime.now())
@@ -191,12 +238,13 @@ class RiskAnalyzer:
                         return not is_exploitable, {
                             "has_mint_authority": has_mint,
                             "has_freeze_authority": has_freeze,
-                            "trust_level": report.get("trustLevel", "unknown")
+                            "trust_level": report.get("trustLevel", "unknown"),
+                            "available": True
                         }
         except Exception as e:
             logger.warning(f"RugCheck API error for {mint}: {e}")
 
-        return True, {}
+        return False, {"available": False}
 
     async def _check_honeypot(self, mint: str) -> Tuple[bool, Dict]:
         """Check if token is a honeypot"""
@@ -214,12 +262,13 @@ class RiskAnalyzer:
                         return is_honeypot, {
                             "honeypot_type": honeypot_type,
                             "buy_tax": token_data.get("buy_tax", 0),
-                            "sell_tax": token_data.get("sell_tax", 0)
+                            "sell_tax": token_data.get("sell_tax", 0),
+                            "available": True
                         }
         except Exception as e:
             logger.warning(f"GoPlus API error for {mint}: {e}")
 
-        return False, {}
+        return False, {"available": False}
 
     async def _check_liquidity(self, mint: str) -> Tuple[bool, Dict]:
         """Check liquidity and LP lock status"""
@@ -244,12 +293,13 @@ class RiskAnalyzer:
                             return liquidity_usd > 5000, {
                                 "liquidity_usd": liquidity_usd,
                                 "lp_locked": lp_locked,
-                                "lock_pct": 100 if lp_locked else 0  # Simplified
+                                "lock_pct": 100 if lp_locked else 0,  # Simplified
+                                "available": True
                             }
         except Exception as e:
             logger.warning(f"Liquidity check error for {mint}: {e}")
 
-        return True, {}
+        return False, {"available": False}
 
     async def _check_holder_distribution(self, mint: str) -> Tuple[bool, Dict]:
         """Analyze holder distribution for concentration"""
@@ -289,12 +339,13 @@ class RiskAnalyzer:
                         return True, {
                             "top_10_pct": top_10_pct,
                             "dev_pct": dev_pct,
-                            "has_cluster": False  # Would need more analysis
+                            "has_cluster": False,  # Would need more analysis
+                            "available": True
                         }
         except Exception as e:
             logger.warning(f"Holder check error for {mint}: {e}")
 
-        return True, {}
+        return False, {"available": False}
 
     async def _check_dev_wallets(self, mint: str) -> Tuple[bool, Dict]:
         """Check developer wallet behavior"""

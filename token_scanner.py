@@ -143,20 +143,29 @@ class PumpPortalScanner(TokenSource):
         if not mint:
             return
 
-        # Initial token data
+        # Initial token data. PumpPortal exposes the trader public key on
+        # trade/create events; retaining it lets us measure real unique
+        # traders instead of assuming every event is a new wallet.
+        trader = data.get("traderPublicKey") or data.get("user") or ""
+        is_buy = bool(data.get("isBuy", False))
         token_data = {
             "mint": mint,
             "name": data.get("name", "Unknown"),
             "symbol": data.get("symbol", "?"),
-            "dev_buy_sol": float(data.get("solAmount", 0)),
-            "market_cap_sol": float(data.get("marketCapSol", 0)),
+            "dev_buy_sol": float(data.get("solAmount", 0) or 0),
+            "market_cap_sol": float(data.get("marketCapSol", 0) or 0),
             "total_trades": 1,
-            "unique_wallets": 1,
-            "buy_trades": 1 if data.get("isBuy", False) else 0,
-            "sell_trades": 0 if data.get("isBuy", True) else 1,
+            "unique_wallets": 1 if trader else 0,
+            "buy_trades": 1 if is_buy else 0,
+            "sell_trades": 0 if is_buy else 1,
+            "creator_address": trader,
+            "traders": {trader} if trader else set(),
+            "buy_traders": {trader} if is_buy and trader else set(),
+            "sell_traders": {trader} if not is_buy and trader else set(),
             "trades": [{
-                "is_buy": data.get("isBuy", False),
-                "sol_amount": float(data.get("solAmount", 0)),
+                "trader": trader,
+                "is_buy": is_buy,
+                "sol_amount": float(data.get("solAmount", 0) or 0),
                 "timestamp": datetime.now()
             }]
         }
@@ -172,18 +181,32 @@ class PumpPortalScanner(TokenSource):
         if not mint or mint not in self._token_buffer:
             return
 
+        is_buy = bool(data.get("isBuy", False))
+        trader = data.get("traderPublicKey") or data.get("user") or ""
+        amount = float(data.get("solAmount", 0) or 0)
         trades = self._token_buffer[mint].get("trades", [])
         trades.append({
-            "is_buy": data.get("isBuy", False),
-            "sol_amount": float(data.get("solAmount", 0)),
+            "trader": trader,
+            "is_buy": is_buy,
+            "sol_amount": amount,
             "timestamp": datetime.now()
         })
 
-        self._token_buffer[mint]["total_trades"] += 1
-        if data.get("isBuy"):
-            self._token_buffer[mint]["buy_trades"] += 1
+        buffered = self._token_buffer[mint]
+        buffered["total_trades"] += 1
+        if trader:
+            buffered.setdefault("traders", set()).add(trader)
+            buffered["unique_wallets"] = len(buffered["traders"])
+        if is_buy:
+            buffered["buy_trades"] += 1
+            if trader:
+                buffered.setdefault("buy_traders", set()).add(trader)
         else:
-            self._token_buffer[mint]["sell_trades"] += 1
+            buffered["sell_trades"] += 1
+            if trader:
+                buffered.setdefault("sell_traders", set()).add(trader)
+                if trader == buffered.get("creator_address"):
+                    buffered["creator_sold"] = True
 
     async def _handle_graduation(self, data: Dict):
         """Handle token graduation to Raydium"""
@@ -203,6 +226,7 @@ class PumpPortalScanner(TokenSource):
 
         # Calculate metrics
         buy_ratio = data["buy_trades"] / max(data["total_trades"], 1)
+        behavior = self._behavior_summary(data)
 
         # Apply filters
         if not self._passes_filters(data, buy_ratio):
@@ -218,7 +242,9 @@ class PumpPortalScanner(TokenSource):
             liquidity_sol=0,  # Will be filled by market data
             buy_ratio=buy_ratio,
             unique_wallets=data["unique_wallets"],
-            total_trades=data["total_trades"]
+            total_trades=data["total_trades"],
+            creator_address=data.get("creator_address"),
+            behavior_data=behavior,
         )
         signal.calculate_overall_score()
 
@@ -228,6 +254,48 @@ class PumpPortalScanner(TokenSource):
                 await callback(signal)
             except Exception as e:
                 logger.error(f"Callback error: {e}")
+
+    @staticmethod
+    def _behavior_summary(data: Dict) -> Dict:
+        """Produce conservative launch-behavior proxies from WS observations.
+
+        These are not proof of manipulation. They are early warning features
+        inspired by bundle/wash/mechanical-trading research and are persisted
+        so they can be evaluated against later outcomes.
+        """
+        trades = data.get("trades", [])
+        buys = [trade for trade in trades if trade.get("is_buy")]
+        sells = [trade for trade in trades if not trade.get("is_buy")]
+        buy_traders = data.get("buy_traders", set())
+        sell_traders = data.get("sell_traders", set())
+        overlap = buy_traders & sell_traders
+
+        from collections import Counter
+        amount_buckets = Counter(round(float(trade.get("sol_amount", 0) or 0), 4) for trade in trades)
+        repeated_amount_ratio = (
+            max(amount_buckets.values()) / len(trades) if len(trades) >= 4 and amount_buckets else 0.0
+        )
+        mechanicality_score = repeated_amount_ratio * 100.0
+        wash_trading_score = (
+            len(overlap) / max(1, min(len(buy_traders), len(sell_traders))) * 100.0
+            if buy_traders and sell_traders else 0.0
+        )
+
+        # A concentration proxy: if a few addresses account for most observed
+        # buys, keep it as a warning until bundle/funding data confirms it.
+        buy_counts = Counter(trade.get("trader") for trade in buys if trade.get("trader"))
+        top_three_buy_share = sum(count for _, count in buy_counts.most_common(3)) / max(1, len(buys))
+        bundle_risk_score = top_three_buy_share * 100.0 if len(buys) >= 5 else 0.0
+        creator_sold = bool(data.get("creator_sold", False))
+        return {
+            "observed_traders": len(data.get("traders", set())),
+            "early_buyer_count": len(data.get("buy_traders", set())),
+            "wash_trading_score": round(min(100.0, wash_trading_score), 2),
+            "mechanicality_score": round(min(100.0, mechanicality_score), 2),
+            "bundle_risk_score": round(min(100.0, bundle_risk_score), 2),
+            "creator_sold": creator_sold,
+            "data_quality": "observed" if data.get("traders") else "limited",
+        }
 
     def _passes_filters(self, data: Dict, buy_ratio: float) -> bool:
         """Check if token passes configured filters"""

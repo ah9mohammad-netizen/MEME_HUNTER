@@ -234,8 +234,8 @@ class WhaleDataFetcher:
     def get_smart_money_summary(token_mint: str, buys: List[Dict]) -> Dict:
         if not buys:
             return {
-                "signal": "NONE", "total_sol": 0.0, "total_buys": 0, "whale_count": 0,
-                "kol_count": 0, "avg_buy": 0.0, "top_buyer": None,
+                "signal": "NONE", "total_sol": 0.0, "total_buys": 0, "wallet_count": 0,
+                "whale_count": 0, "kol_count": 0, "avg_buy": 0.0, "avg_win_rate": 0.0, "top_buyer": None,
                 "conviction": "LOW", "all_buys": [],
             }
         total_sol = sum(float(item.get("sol_amount", 0) or 0) for item in buys)
@@ -249,9 +249,16 @@ class WhaleDataFetcher:
             signal, conviction = "WEAK", "LOW"
         else:
             signal, conviction = "MINIMAL", "VERY_LOW"
+        known_win_rates = [
+            float(item.get("win_rate", 0) or 0) for item in buys
+            if item.get("win_rate") is not None
+        ]
         return {
-            "signal": signal, "total_sol": total_sol, "total_buys": len(buys), "whale_count": len(whale_buys),
+            "signal": signal, "total_sol": total_sol, "total_buys": len(buys),
+            "wallet_count": len({item.get("address", item.get("wallet")) for item in buys}),
+            "whale_count": len(whale_buys),
             "kol_count": len(kol_buys), "avg_buy": total_sol / len(buys),
+            "avg_win_rate": sum(known_win_rates) / len(known_win_rates) if known_win_rates else 0.0,
             "top_buyer": max(buys, key=lambda item: item.get("sol_amount", 0)),
             "conviction": conviction, "all_buys": buys,
         }

@@ -36,6 +36,7 @@ class TradingConfig:
     dca_entries: int = 3
     dca_spacing_pct: float = 10.0
     dca_increment_mult: float = 1.5
+    dca_wait_for_dips: bool = True
 
     # Grid selling settings
     grid_levels: int = 5
@@ -45,8 +46,19 @@ class TradingConfig:
 
     # Risk management
     stop_loss_pct: float = 30.0
+    trailing_stop_activation_pct: float = 50.0
+    trailing_stop_distance_pct: float = 15.0
+    # Kept as a compatibility alias for older configurations.
     trailing_stop_pct: float = 15.0
     max_slippage_bps: int = 500
+
+    # Paper execution realism. Fees/slippage are deliberately explicit so
+    # paper results are not confused with ideal quote returns.
+    paper_fee_bps: int = 100
+    paper_slippage_bps: int = 50
+
+    # Smart-money confirmation must be convergent by default.
+    min_confirming_whales: int = 2
 
     # Indicators & filters
     min_liquidity_usd: float = 5000.0

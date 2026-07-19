@@ -187,6 +187,7 @@ class Position:
     # DCA tracking
     dca_orders: List[DCAOrder] = field(default_factory=list)
     dca_complete: bool = False
+    dca_pending_sol: float = 0.0
 
     # Grid setup
     grid_levels: List[GridLevel] = field(default_factory=list)
@@ -246,6 +247,11 @@ class TokenSignal:
     kol_mentions: int = 0
     kol_wallets: List[str] = field(default_factory=list)
 
+    # Behavioral traces collected by the scanner. These are deliberately
+    # optional because DexScreener signals do not expose launch-level traces.
+    creator_address: Optional[str] = None
+    behavior_data: Dict = field(default_factory=dict)
+
     # Social signals
     twitter_mentions: int = 0
     telegram_members: int = 0
@@ -254,36 +260,47 @@ class TokenSignal:
     discovered_at: datetime = field(default_factory=datetime.now)
 
     def calculate_overall_score(self) -> float:
-        """Calculate weighted overall score"""
-        from config import config
+        """Calculate a bounded 0–100 opportunity score.
 
-        # Momentum indicators (volume, buys, wallets)
+        The previous score could exceed 100 and allowed low market cap alone
+        to dominate the decision. This version keeps opportunity, market
+        quality, momentum and smart-money context separate. Risk analysis is
+        still an independent hard gate.
+        """
+        # Momentum: 35 points.
         momentum = (
-            self.buy_ratio * config.WEIGHTS.buy_ratio +
-            min(self.unique_wallets / 50, 1.0) * config.WEIGHTS.unique_wallets +
-            min(self.total_trades / 100, 1.0) * config.WEIGHTS.volume_24h
+            min(max(self.buy_ratio, 0.0), 1.0) * 15.0
+            + min(max(self.unique_wallets, 0) / 50.0, 1.0) * 10.0
+            + min(max(self.total_trades, 0) / 100.0, 1.0) * 10.0
         )
 
-        # Safety (dev buy, liquidity)
-        safety = (
-            min(self.dev_buy_sol / 2.0, 1.0) * config.WEIGHTS.dev_buy +
-            min(self.liquidity_sol / 10000, 1.0) * config.WEIGHTS.liquidity
+        # Market quality: 20 points. Unknown developer buy/liquidity does not
+        # receive credit; the separate risk gate must validate missing data.
+        quality = (
+            min(max(self.dev_buy_sol, 0.0) / 2.0, 1.0) * 10.0
+            + min(max(self.liquidity_sol, 0.0) / 50.0, 1.0) * 10.0
         )
 
-        # Potential (market cap opportunity)
-        potential = 100 - min(self.market_cap_sol, 100)  # Lower mcap = higher potential
+        # Opportunity: 25 points, capped at the configured scanner range.
+        market_cap_ratio = min(max(self.market_cap_sol, 0.0) / 50.0, 1.0)
+        potential = (1.0 - market_cap_ratio) * 25.0
 
-        # KOL bonus
-        kol_bonus = self.kol_mentions * 5
+        # Smart-money context: 20 points, deliberately capped.
+        smart_money = min(20.0, self.kol_mentions * 5.0 + (10.0 if self.is_whale_alert else 0.0))
 
-        # Whale alert bonus
-        whale_bonus = 20 if self.is_whale_alert else 0
+        # Penalize launch-level behavior only when traces are available.
+        behavior = self.behavior_data or {}
+        behavior_scores = [
+            float(behavior.get("wash_trading_score", 0.0) or 0.0),
+            float(behavior.get("bundle_risk_score", 0.0) or 0.0),
+            float(behavior.get("mechanicality_score", 0.0) or 0.0),
+        ]
+        behavior_penalty = min(20.0, max(behavior_scores, default=0.0) / 100.0 * 20.0)
 
         self.momentum_score = momentum
-        self.safety_score = safety
+        self.safety_score = quality
         self.potential_score = potential
-        self.overall_score = momentum + safety + potential + kol_bonus + whale_bonus
-
+        self.overall_score = max(0.0, min(100.0, momentum + quality + potential + smart_money - behavior_penalty))
         return self.overall_score
 
 

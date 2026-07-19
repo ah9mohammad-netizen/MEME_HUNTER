@@ -59,58 +59,100 @@ class DCAExecutor:
             )
         return levels
 
+    async def _fill_order(self, position: Position, order: DCAOrder) -> bool:
+        """Fill one DCA order and append the immutable buy ledger event."""
+        try:
+            result = await self.client.execute_buy(
+                mint=position.token_mint,
+                sol_amount=order.amount_sol,
+                slippage_bps=config.TRADING.max_slippage_bps,
+            )
+            if not result_ok(result):
+                order.status = "failed"
+                logger.warning(
+                    "DCA leg %s failed for %s: %s",
+                    order.leg_number,
+                    position.token_symbol,
+                    result_value(result, "error", "unknown"),
+                )
+                return False
+            tokens = float(result_value(result, "tokens_received", 0) or 0)
+            actual_price = float(result_value(result, "price", 0) or 0) or order.expected_price
+            order.actual_price = actual_price
+            order.tx_signature = result_value(result, "signature")
+            order.status = "filled"
+            order.filled_at = datetime.now()
+            position.total_invested_sol += order.amount_sol
+            position.total_tokens += tokens
+            position.remaining_cost_sol += order.amount_sol
+            self.store.record_trade(
+                position_mint=position.token_mint,
+                symbol=position.token_symbol,
+                side="buy",
+                strategy="dca",
+                reason=f"DCA leg {order.leg_number}",
+                sol_amount=order.amount_sol,
+                token_amount=tokens,
+                price=actual_price,
+                fee_sol=float(result_value(result, "gas_used", 0) or 0),
+                tx_signature=order.tx_signature,
+            )
+            return True
+        except Exception as exc:
+            order.status = "failed"
+            logger.error("DCA leg %s failed for %s: %s", order.leg_number, position.token_symbol, exc)
+            return False
+
     async def execute_dca(
-        self, mint: str, symbol: str, entry_price: float, total_sol_budget: float,
-        signal_score: float = 0.0, actors: Optional[List[Dict]] = None,
+        self,
+        mint: str,
+        symbol: str,
+        entry_price: float,
+        total_sol_budget: float,
+        signal_score: float = 0.0,
+        actors: Optional[List[Dict]] = None,
     ) -> Optional[Position]:
         cfg = config.TRADING
         position = Position(
-            token_mint=mint, token_symbol=symbol, entry_price=entry_price,
-            total_invested_sol=0.0, total_tokens=0.0,
-            status=TokenStatus.DCA_ENTRING, entry_signal_score=signal_score,
-            associated_wallets=[item.get("address", item.get("wallet", "")) for item in (actors or []) if isinstance(item, dict)],
+            token_mint=mint,
+            token_symbol=symbol,
+            entry_price=entry_price,
+            total_invested_sol=0.0,
+            total_tokens=0.0,
+            status=TokenStatus.DCA_ENTRING,
+            entry_signal_score=signal_score,
+            associated_wallets=[
+                item.get("address", item.get("wallet", ""))
+                for item in (actors or [])
+                if isinstance(item, dict)
+            ],
             actor_evidence=list(actors or []),
         )
         sizes = self._sizes(total_sol_budget, cfg.dca_entries, cfg.dca_increment_mult)
-        prices = [entry_price if index == 0 else entry_price * (1 - cfg.dca_spacing_pct / 100 * index)
-                  for index in range(len(sizes))]
+        prices = [
+            entry_price if index == 0
+            else entry_price * (1 - cfg.dca_spacing_pct / 100 * index)
+            for index in range(len(sizes))
+        ]
 
         for index, (sol_amount, expected_price) in enumerate(zip(sizes, prices), start=1):
             order = DCAOrder(
                 order_id=f"dca_{mint[:8]}_{index}_{datetime.now().timestamp()}",
-                leg_number=index, amount_sol=sol_amount, expected_price=expected_price,
+                leg_number=index,
+                amount_sol=sol_amount,
+                expected_price=expected_price,
             )
-            try:
-                result = await self.client.execute_buy(
-                    mint=mint, sol_amount=sol_amount, slippage_bps=cfg.max_slippage_bps
-                )
-                if not result_ok(result):
-                    order.status = "failed"
-                    logger.warning("DCA leg %s failed for %s: %s", index, symbol, result_value(result, "error", "unknown"))
-                    position.dca_orders.append(order)
-                    continue
-                tokens = float(result_value(result, "tokens_received", 0) or 0)
-                actual_price = float(result_value(result, "price", 0) or 0) or expected_price
-                order.actual_price = actual_price
-                order.tx_signature = result_value(result, "signature")
-                order.status = "filled"
-                order.filled_at = datetime.now()
+            # The first leg establishes a position. Later legs remain pending
+            # until price reaches their target when dip-aware DCA is enabled.
+            if cfg.dca_wait_for_dips and index > 1:
                 position.dca_orders.append(order)
-                position.total_invested_sol += sol_amount
-                position.total_tokens += tokens
-                position.remaining_cost_sol += sol_amount
-                self.store.record_trade(
-                    position_mint=mint, symbol=symbol, side="buy", strategy="dca",
-                    reason=f"DCA leg {index}", sol_amount=sol_amount,
-                    token_amount=tokens, price=actual_price,
-                    fee_sol=float(result_value(result, "gas_used", 0) or 0),
-                    tx_signature=result_value(result, "signature"),
-                )
-            except Exception as exc:
-                order.status = "failed"
-                position.dca_orders.append(order)
-                logger.error("DCA leg %s failed for %s: %s", index, symbol, exc)
+                continue
+            position.dca_orders.append(order)
+            await self._fill_order(position, order)
 
+        position.dca_pending_sol = sum(
+            order.amount_sol for order in position.dca_orders if order.status == "pending"
+        )
         if position.total_tokens <= 0 or position.total_invested_sol <= 0:
             return None
         position.entry_price = position.total_invested_sol / position.total_tokens
@@ -119,9 +161,28 @@ class DCAExecutor:
         position.grid_initial_tokens = position.total_tokens
         position.moon_bag_tokens = position.total_tokens * cfg.moon_bag_pct / 100
         position.peak_price = position.entry_price
-        position.dca_complete = True
+        position.dca_complete = position.dca_pending_sol <= 0
         position.status = TokenStatus.HOLDING
         return position
+
+    async def execute_pending(self, position: Position, current_price: float) -> float:
+        """Fill pending DCA legs only after their lower target is reached."""
+        filled_sol = 0.0
+        for order in position.dca_orders:
+            if order.status != "pending" or current_price > order.expected_price:
+                continue
+            if await self._fill_order(position, order):
+                filled_sol += order.amount_sol
+                position.dca_pending_sol = max(0.0, position.dca_pending_sol - order.amount_sol)
+                position.entry_price = position.total_invested_sol / position.total_tokens
+                position.stop_loss_price = position.entry_price * (1 - config.TRADING.stop_loss_pct / 100)
+                position.grid_initial_tokens += max(0.0, position.total_tokens - position.grid_initial_tokens)
+                position.moon_bag_tokens = position.total_tokens * config.TRADING.moon_bag_pct / 100
+        position.dca_pending_sol = sum(
+            order.amount_sol for order in position.dca_orders if order.status == "pending"
+        )
+        position.dca_complete = position.dca_pending_sol <= 0
+        return filled_sol
 
     async def add_dca_leg(self, position: Position, additional_sol: float) -> DCAOrder:
         """Add a manual/emergency DCA leg, subject to the caller's balance guard."""
@@ -147,6 +208,8 @@ class DCAExecutor:
             position.total_invested_sol += additional_sol
             position.remaining_cost_sol += additional_sol
             position.total_tokens += tokens
+            position.grid_initial_tokens += tokens
+            position.moon_bag_tokens = position.total_tokens * config.TRADING.moon_bag_pct / 100
             position.entry_price = position.total_invested_sol / position.total_tokens
             position.stop_loss_price = position.entry_price * (1 - config.TRADING.stop_loss_pct / 100)
             self.store.record_trade(
@@ -315,7 +378,12 @@ class TradingEngine:
         position = self.active_positions.get(mint)
         if not position:
             return None
-        remaining_cap = max(0.0, self.capital_manager.position_cap_sol() - position.total_invested_sol)
+        remaining_cap = max(
+            0.0,
+            self.capital_manager.position_cap_sol()
+            - position.total_invested_sol
+            - position.dca_pending_sol,
+        )
         requested = min(float(amount_sol), remaining_cap)
         if requested < config.TRADING.min_trade_sol:
             return None
@@ -338,6 +406,9 @@ class TradingEngine:
                 continue
             self.momentum_detector.record_price(mint, current_price)
             position.peak_price = max(position.peak_price or position.entry_price, current_price)
+            pending_spend = await self.dca_executor.execute_pending(position, current_price)
+            if pending_spend > 0:
+                self.capital_manager.update_after_execution(pending_spend)
             grid_fills = await self.grid_seller.monitor_and_sell(position, current_price)
             for fill in grid_fills:
                 self.capital_manager.update_after_receipt(fill.get("proceeds", 0))
@@ -348,11 +419,13 @@ class TradingEngine:
             if position.stop_loss_price and current_price <= position.stop_loss_price:
                 await self._emergency_exit(position, "Stop loss triggered")
                 continue
-            if position.peak_price >= position.entry_price * (1 + config.TRADING.trailing_stop_pct / 100):
+            activation_pct = config.TRADING.trailing_stop_activation_pct
+            distance_pct = config.TRADING.trailing_stop_distance_pct
+            if position.peak_price >= position.entry_price * (1 + activation_pct / 100):
                 position.trailing_stop_active = True
                 position.trailing_stop_price = max(
                     position.trailing_stop_price,
-                    position.peak_price * (1 - config.TRADING.trailing_stop_pct / 100),
+                    position.peak_price * (1 - distance_pct / 100),
                 )
             if position.trailing_stop_active and current_price <= position.trailing_stop_price:
                 await self._emergency_exit(position, "Trailing stop triggered")

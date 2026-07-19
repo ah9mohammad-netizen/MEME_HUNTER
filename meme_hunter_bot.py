@@ -141,10 +141,16 @@ class MemeHunterBot:
             "MAX_COINS_TRACKED": ("max_coins_tracked", int),
             "DCA_ENTRIES": ("dca_entries", int),
             "DCA_SPACING_PCT": ("dca_spacing_pct", float),
+            "DCA_WAIT_FOR_DIPS": ("dca_wait_for_dips", lambda value: str(value).lower() in {"1", "true", "yes"}),
             "GRID_LEVELS": ("grid_levels", int),
             "STOP_LOSS_PCT": ("stop_loss_pct", float),
             "TRAILING_STOP_PCT": ("trailing_stop_pct", float),
+            "TRAILING_STOP_ACTIVATION_PCT": ("trailing_stop_activation_pct", float),
+            "TRAILING_STOP_DISTANCE_PCT": ("trailing_stop_distance_pct", float),
             "MOON_BAG_PCT": ("moon_bag_pct", float),
+            "PAPER_FEE_BPS": ("paper_fee_bps", int),
+            "PAPER_SLIPPAGE_BPS": ("paper_slippage_bps", int),
+            "MIN_CONFIRMING_WHALES": ("min_confirming_whales", int),
             "LEARNED_WALLET_MIN_PROFIT_SOL": ("learned_wallet_min_profit_sol", float),
             "TRADE_HISTORY_DB_PATH": ("trade_history_db_path", str),
             "WALLETS_DB_PATH": ("wallets_db_path", str),
@@ -327,7 +333,9 @@ class MemeHunterBot:
             return
 
         # Perform risk analysis
-        risk_report = await self.risk_analyzer.analyze(signal.mint)
+        risk_report = await self.risk_analyzer.analyze(
+            signal.mint, behavior_data=signal.behavior_data
+        )
 
         logger.info(
             f"   📊 Risk Analysis:\n"
@@ -340,7 +348,10 @@ class MemeHunterBot:
                 logger.info(f"   {warning}")
 
         # Check whale activity - USE LIGHTWEIGHT FETCHER
-        whale_summary = {"total_sol": 0.0, "all_buys": [], "top_buyer": None}
+        whale_summary = {
+            "total_sol": 0.0, "total_buys": 0, "wallet_count": 0,
+            "all_buys": [], "top_buyer": None,
+        }
         try:
             whale_summary = await get_whale_activity_for_token(signal.mint)
 
@@ -352,12 +363,21 @@ class MemeHunterBot:
                     f"   Signal: {whale_summary['signal']}\n"
                     f"   Conviction: {whale_summary['conviction']}"
                 )
-                signal.is_whale_alert = whale_summary["total_sol"] > 1
+                # Require convergence from multiple distinct wallets for a
+                # whale alert; one large wallet is evidence, not confirmation.
+                signal.is_whale_alert = (
+                    whale_summary["total_sol"] > 1
+                    and whale_summary.get("wallet_count", 0) >= config.TRADING.min_confirming_whales
+                )
                 if whale_summary['top_buyer']:
                     signal.whale_address = whale_summary['top_buyer']['wallet']
                     signal.kol_wallets = [b['wallet'] for b in whale_summary['all_buys']]
         except Exception as e:
             logger.warning(f"Whale check failed (non-critical): {e}")
+
+        # Recalculate the bounded opportunity score now that smart-money
+        # context is known.
+        signal.calculate_overall_score()
 
         # Use persisted actor outcomes as a small, explainable adjustment.
         # Historical evidence never overrides the risk gate.
@@ -385,7 +405,11 @@ class MemeHunterBot:
             risk_score=risk_report.overall_score,
             whale_sol=whale_summary.get("total_sol", 0.0), decision=decision,
             reason=risk_report.get_recommendation(),
-            metadata={"whale_count": whale_summary.get("total_buys", 0)},
+            metadata={
+                "whale_count": whale_summary.get("total_buys", 0),
+                "whale_wallet_count": whale_summary.get("wallet_count", 0),
+                "behavior": signal.behavior_data,
+            },
         )
 
         if should_trade:

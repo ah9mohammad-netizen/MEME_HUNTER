@@ -71,8 +71,8 @@ Signals are deduplicated by mint during the process lifetime.
 - KOL mention: +5 each
 - whale alert: +20
 
-The score is not normalized to 100 and can exceed 100. Signals below `40` are
-rejected before the expensive risk analysis.
+The score is bounded to 0–100. Signals below `40` are rejected before the
+expensive risk analysis. Behavior proxies can subtract up to 20 points.
 
 ## 4. Risk gate
 
@@ -83,6 +83,11 @@ Risk checks run in parallel and are cached for approximately 60 seconds:
 - liquidity and LP information
 - holder concentration
 - developer wallet/cluster behavior
+- launch behavior proxies: wash trading, mechanical trade repetition,
+  coordinated early-wallet concentration and early creator selling
+
+Required contract, honeypot, liquidity and holder checks must be available;
+otherwise the risk gate fails closed.
 
 Risk score weighting:
 
@@ -114,8 +119,9 @@ Smart-money classification is based on tracked buys for the token:
 | 5–10 SOL | MODERATE |
 | >=10 SOL | STRONG |
 
-A whale alert is activated above `1 SOL` of tracked buying. A whale-assisted
-approval requires at least `2 SOL` of tracked buying and a passing risk gate.
+A whale alert is activated above `1 SOL` of tracked buying and at least two
+distinct confirming wallets by default. A whale-assisted approval requires at
+least `2 SOL` of tracked buying and a passing risk gate.
 
 ## 6. Final approval
 
@@ -128,7 +134,7 @@ risk score >= 50 AND opportunity score >= 60
 Whale-assisted approval:
 
 ```text
-risk score >= 50 AND whale purchases >= 2 SOL
+risk score >= 50 AND whale purchases >= 2 SOL AND confirming wallets >= 2
 ```
 
 Automatic opening occurs when:
@@ -154,9 +160,9 @@ The default DCA budget distribution uses a `1.5x` increment:
 - leg 2: 31.58%
 - leg 3: 47.37%
 
-Current behavior is staged sizing: all three legs are sent sequentially. The
-lower expected prices are recorded, but later legs do not currently wait for a
-market dip.
+The first leg opens the position. When `dca_wait_for_dips=true`, later legs
+remain pending and are filled only when their lower target is reached. Their
+capital remains reserved in the exposure calculation.
 
 ## 8. Position management
 
@@ -177,10 +183,8 @@ Grid:
 The grid sells 80% and reserves 20% as a moon bag. A manual close or risk exit
 sells the remaining tokens, including the moon bag.
 
-The current code uses the configured trailing-stop percentage for both
-activation and distance. With the default `15%`, trailing protection can
-activate around +15%, although some documentation describes +50% activation.
-This discrepancy must be resolved before live trading.
+Trailing protection now has separate activation and distance settings. The
+default is activation at +50% and a 15% trailing distance.
 
 ## 9. Recording and learning
 
@@ -200,19 +204,18 @@ signal by a small capped amount:
 The current learner does not automatically rewrite DCA, grid, stop-loss or
 scanner parameters.
 
-## Known implementation gaps to keep visible
+## Remaining implementation gaps to keep visible
 
-1. PumpPortal initializes unique-wallet count but does not currently increment
-   it for subsequent traders, so its unique-wallet filter may reject candidates.
-2. The opportunity score is not normalized.
-3. Failed API checks have permissive fallbacks in parts of the risk analyzer;
-   unavailable evidence is not always treated as a rejection.
-4. DCA legs are not conditional on lower prices.
-5. Paper trading does not yet fully model fees, slippage, failed fills or
-   priority fees.
-6. Wallet evidence comes from associated tracked actors, not a complete
+1. Bundle/funding relationships are still heuristic proxies until a dedicated
+   on-chain bundle/funding data source is added.
+2. Wash-trading and mechanicality scores are early-window indicators, not
+   proof of manipulation.
+3. Wallet evidence comes from associated tracked actors, not a complete
    on-chain reconstruction of every actor in a token.
-7. The code and documentation disagree on trailing-stop activation.
+4. Paper mode models configurable fee and slippage assumptions but not every
+   priority-fee, routing or failed-transaction effect.
+5. The learner adjusts signal context only; it does not yet automatically
+   retrain or change strategy parameters.
 
-These gaps should be addressed deliberately, one at a time, after the paper
-trading baseline has collected enough observations.
+These gaps should be addressed deliberately, one at a time, after paper
+trading has collected enough forward observations.

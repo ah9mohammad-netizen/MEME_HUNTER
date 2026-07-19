@@ -55,7 +55,8 @@ class CapitalManager:
         for position in positions:
             # Older persisted positions do not have remaining_cost_sol.
             remaining = getattr(position, "remaining_cost_sol", 0.0)
-            total += remaining if remaining > 0 else position.total_invested_sol
+            pending = getattr(position, "dca_pending_sol", 0.0)
+            total += (remaining if remaining > 0 else position.total_invested_sol) + max(0.0, pending)
         return max(0.0, total)
 
     def max_exposure_sol(self) -> float:

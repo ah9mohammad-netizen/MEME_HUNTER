@@ -41,13 +41,14 @@ MEME HUNTER is a comprehensive trading bot designed to discover high-potential m
 
 #### DCA (Dollar Cost Averaging)
 ```
-Entry Strategy (default 1.5x increment, sent as sequential fills):
+Entry Strategy (default 1.5x increment, dip-aware):
 ├── Leg 1: 21.05% of approved budget @ current quote
-├── Leg 2: 31.58% of approved budget (10% lower expected target)
-└── Leg 3: 47.37% of approved budget (20% lower expected target)
+├── Leg 2: 31.58% of approved budget at a 10% lower target
+└── Leg 3: 47.37% of approved budget at a 20% lower target
 
-The fill price returned by the swap is recorded; the target is not treated as a
-filled price.
+The first leg opens the position. Later legs remain reserved and are only
+filled when their target is reached. Paper fills include configurable fee and
+slippage assumptions.
 ```
 
 #### Grid Selling
