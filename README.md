@@ -163,8 +163,7 @@ Or use environment variables:
 ```bash
 export PAPER_TRADING=true
 export PAPER_STARTING_BALANCE_SOL=1.0
-export TRADE_HISTORY_DB_PATH=/data/trade_history.db
-export WALLETS_DB_PATH=/data/wallets_list.db
+export DATA_DIR=/data  # derives both SQLite files under the one volume
 # Only for live mode:
 # export PAPER_TRADING=false
 # export WALLET_PRIVATE_KEY="your_base58_key"

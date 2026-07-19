@@ -1,8 +1,9 @@
 """Durable SQLite state for trades, positions, snapshots and learned actors.
 
-Railway containers can restart.  Set ``STATE_DB_PATH``/``DB_PATH`` to a file on
-an attached Railway volume (for example ``/data/meme_hunter.sqlite3``) if the
-history must survive redeploys as well as restarts.
+Railway containers can restart. Set ``DATA_DIR=/data`` when the service has
+one attached Railway Volume. The trade-history file is then
+``/data/trade_history.db``; the wallet list is managed separately by
+``wallet_store.py`` at ``/data/wallets_list.db``.
 """
 
 from __future__ import annotations
@@ -19,6 +20,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
 
 from models import DCAOrder, GridLevel, Position, TokenStatus
+from storage_paths import default_trade_history_path
 
 logger = logging.getLogger(__name__)
 
@@ -27,7 +29,7 @@ class StateStore:
     """Small synchronous SQLite repository; writes are short and transactional."""
 
     def __init__(self, path: Optional[str] = None):
-        self.path = path or os.getenv("STATE_DB_PATH") or os.getenv("DB_PATH") or config_path()
+        self.path = path or os.getenv("TRADE_HISTORY_DB_PATH") or os.getenv("STATE_DB_PATH") or os.getenv("DB_PATH") or config_path()
         if self.path != ":memory:":
             Path(self.path).expanduser().parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.RLock()
@@ -301,7 +303,7 @@ class StateStore:
 
 def config_path() -> str:
     """Resolve the configured DB path without importing the global config."""
-    return os.getenv("MEME_HUNTER_DB", "meme_hunter.sqlite3")
+    return os.getenv("MEME_HUNTER_DB") or default_trade_history_path()
 
 
 def _parse_datetime(value: Any) -> datetime:

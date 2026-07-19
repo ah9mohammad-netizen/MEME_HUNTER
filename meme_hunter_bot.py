@@ -23,6 +23,7 @@ from capital_manager import CapitalManager
 from learning import TradeLearner
 from state_store import StateStore
 from wallet_store import WalletStore
+from storage_paths import default_trade_history_path, default_wallets_path
 from trading_engine import TradingEngine
 from solana_client import SolanaTradingClient, PaperTradingClient, PumpFunTrader
 from whale_data import whale_fetcher, trending_fetcher, get_whale_activity_for_token
@@ -52,8 +53,13 @@ class MemeHunterBot:
         trade_path = config.TRADING.trade_history_db_path
         if config.TRADING.state_db_path != "trade_history.db":
             trade_path = config.TRADING.state_db_path
+        if trade_path == "trade_history.db":
+            trade_path = default_trade_history_path()
+        wallet_path = config.TRADING.wallets_db_path
+        if wallet_path == "wallets_list.db":
+            wallet_path = default_wallets_path()
         self.store = StateStore(trade_path)
-        self.wallet_store = WalletStore(config.TRADING.wallets_db_path)
+        self.wallet_store = WalletStore(wallet_path)
 
         # Paper mode is the default. It uses live public prices for realistic
         # fills, but never loads a key or broadcasts a transaction.

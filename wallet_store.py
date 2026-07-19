@@ -10,12 +10,14 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from storage_paths import default_wallets_path
+
 
 class WalletStore:
     """Keep wallet definitions and profitable-token evidence in one small DB."""
 
     def __init__(self, path: Optional[str] = None):
-        self.path = path or os.getenv("WALLETS_DB_PATH") or "wallets_list.db"
+        self.path = path or os.getenv("WALLETS_DB_PATH") or default_wallets_path()
         if self.path != ":memory:":
             Path(self.path).expanduser().parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.RLock()

@@ -40,8 +40,7 @@ MAX_COINS_TRACKED=10
 # Learning and two separate Railway-backed databases
 AUTO_LEARN_WALLETS=true
 LEARNED_WALLET_MIN_PROFIT_SOL=0.01
-TRADE_HISTORY_DB_PATH=/data/trade_history.db
-WALLETS_DB_PATH=/data/wallets_list.db
+DATA_DIR=/data
 
 # Optional
 LOG_LEVEL=INFO
