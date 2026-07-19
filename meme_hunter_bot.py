@@ -196,8 +196,8 @@ class MemeHunterBot:
                     await reader.read(1024)
                     body = b"ok"
                     writer.write(
-                        b"HTTP/1.1 200 OK\\r\\nContent-Type: text/plain\\r\\n"
-                        + f"Content-Length: {len(body)}\\r\\nConnection: close\\r\\n\\r\\n".encode()
+                        b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n"
+                        + f"Content-Length: {len(body)}\r\nConnection: close\r\n\r\n".encode()
                         + body
                     )
                     await writer.drain()
