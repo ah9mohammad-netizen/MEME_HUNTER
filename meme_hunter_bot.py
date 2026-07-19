@@ -291,7 +291,10 @@ class MemeHunterBot:
                 first_run = False
                 if not self.paused:
                     result = await update_whale_list_from_gmgn(limit=50)
-                    logger.info(f"Whale list updated: {result['count']} wallets")
+                    logger.info(
+                        "Whale list refresh: %s new GMGN wallets, %s total tracked",
+                        result["count"], result.get("tracked_count", result["count"]),
+                    )
             except Exception as e:
                 logger.error(f"Whale updater error: {e}")
                 await asyncio.sleep(30)

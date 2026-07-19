@@ -43,6 +43,12 @@ class WhaleDataFetcher:
         self._cache: Dict[str, tuple] = {}
         self._request_times: List[float] = []
         self.gmgn_base = "https://gmgn.ai/api/v1"
+        self.gmgn_quotation_base = "https://gmgn.ai/defi/quotation/v1"
+        self.request_headers = {
+            "User-Agent": "Mozilla/5.0 (compatible; MEME-HUNTER/1.0)",
+            "Accept": "application/json, text/plain, */*",
+            "Referer": "https://gmgn.ai/",
+        }
         self._init_whale_wallets()
         self._load_learned_wallets()
 
@@ -104,20 +110,24 @@ class WhaleDataFetcher:
         session: aiohttp.ClientSession,
         url: str,
         params: Optional[Dict[str, Any]] = None,
+        headers: Optional[Dict[str, str]] = None,
     ) -> Optional[Dict[str, Any]]:
         while self._is_rate_limited():
             await asyncio.sleep(0.5)
         self._request_times.append(time.time())
         try:
             async with session.get(
-                url, params=params, timeout=aiohttp.ClientTimeout(total=10)
+                url,
+                params=params,
+                headers=headers or self.request_headers,
+                timeout=aiohttp.ClientTimeout(total=10),
             ) as response:
                 if response.status == 429:
                     logger.warning("GMGN rate limit; backing off")
                     await asyncio.sleep(5)
                     return None
                 if response.status != 200:
-                    logger.debug("GMGN response %s for %s", response.status, url)
+                    logger.warning("GMGN response %s for %s", response.status, url)
                     return None
                 payload = await response.json()
                 return payload if isinstance(payload, dict) else None
@@ -143,17 +153,45 @@ class WhaleDataFetcher:
         cached = self._get_cache(key)
         if cached is not None:
             return cached
+        params = {"limit": limit, "order_by": "pnl_7d", "sort": "desc"}
         async with aiohttp.ClientSession() as session:
+            # The old /api/v1 endpoint is retained as a first attempt. GMGN's
+            # public web endpoint has moved to /defi/quotation/v1, so fall back
+            # to the browser-facing leaderboard when the legacy response is
+            # empty or unavailable.
             payload = await self._request(
-                session, f"{self.gmgn_base}/wallets/{chain}",
-                {"limit": limit, "order_by": "pnl_7d", "sort": "desc"},
+                session, f"{self.gmgn_base}/wallets/{chain}", params
             )
-        data = payload.get("data", {}) if payload else {}
-        traders = data.get("wallets", []) if isinstance(data, dict) else []
+            data = payload.get("data", {}) if payload else {}
+            traders = data.get("wallets", []) if isinstance(data, dict) else []
+            if not traders:
+                rank_url = f"{self.gmgn_quotation_base}/rank/{chain}/wallets/7d"
+                rank_params = {
+                    "orderby": "pnl_7d",
+                    "direction": "desc",
+                    "limit": limit,
+                }
+                rank_payload = await self._request(session, rank_url, rank_params)
+                rank_data = rank_payload.get("data", {}) if rank_payload else {}
+                if isinstance(rank_data, dict):
+                    traders = rank_data.get("rank") or rank_data.get("wallets") or []
+        if not isinstance(traders, list):
+            traders = []
         for trader in traders:
-            address = trader.get("address")
+            address = (
+                trader.get("address")
+                or trader.get("wallet_address")
+                or trader.get("wallet")
+            )
             if address:
-                self.add_wallet(address, trader.get("name", f"GMGN_{address[:8]}"), "gmgn", 1.0)
+                self.add_wallet(
+                    address,
+                    trader.get("name") or trader.get("twitter_username") or f"GMGN_{address[:8]}",
+                    "gmgn",
+                    1.0,
+                )
+        if not traders:
+            logger.warning("GMGN returned no top traders; whale confirmation is unavailable")
         self._set_cache(key, traders)
         return traders
 
@@ -331,4 +369,8 @@ async def get_whale_activity_for_token(mint: str) -> Dict:
 
 async def update_whale_list_from_gmgn(limit: int = 100) -> Dict:
     traders = await whale_fetcher.fetch_top_traders(limit=limit)
-    return {"count": len(traders), "sources": ["GMGN leaderboard"]}
+    return {
+        "count": len(traders),
+        "tracked_count": len(whale_fetcher.whale_wallets),
+        "sources": ["GMGN leaderboard"],
+    }
