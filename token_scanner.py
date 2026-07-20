@@ -544,23 +544,35 @@ class TokenScanner:
         self.scanners: List[TokenSource] = []
         self.active_signals: Dict[str, TokenSignal] = {}
         self.on_signal: Optional[Callable] = None
+        self._scanner_tasks: List[asyncio.Task] = []
 
     def add_scanner(self, scanner: TokenSource):
         """Add a token source scanner"""
         self.scanners.append(scanner)
 
     async def start(self, on_signal: Callable[[TokenSignal], None]):
-        """Start all scanners"""
+        """Start all scanners concurrently.
+
+        A WebSocket scanner's ``subscribe`` method is intentionally long-lived;
+        awaiting it inside the startup loop prevents every later scanner from
+        ever starting. Each source must therefore receive its own task.
+        """
         self.on_signal = on_signal
 
         for scanner in self.scanners:
             try:
                 await scanner.connect()
-                await scanner.subscribe(self._handle_signal)
-            except Exception as e:
-                logger.error(f"Scanner failed to start: {e}")
+            except Exception as exc:
+                logger.error("Scanner failed to connect: %s", exc)
 
-        # Keep running
+        self._scanner_tasks = [
+            asyncio.create_task(scanner.subscribe(self._handle_signal))
+            for scanner in self.scanners
+            if getattr(scanner, "running", False)
+        ]
+        logger.info("Started %s scanner subscription task(s)", len(self._scanner_tasks))
+
+        # Keep the unified scanner alive while source tasks receive events.
         while True:
             await asyncio.sleep(1)
 
@@ -580,5 +592,10 @@ class TokenScanner:
 
     async def stop(self):
         """Stop all scanners"""
+        for task in self._scanner_tasks:
+            task.cancel()
+        if self._scanner_tasks:
+            await asyncio.gather(*self._scanner_tasks, return_exceptions=True)
+        self._scanner_tasks.clear()
         for scanner in self.scanners:
             await scanner.disconnect()
