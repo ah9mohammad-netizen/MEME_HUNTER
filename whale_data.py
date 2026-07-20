@@ -298,28 +298,21 @@ class WhaleDataFetcher:
         cached = self._get_cache(key)
         if cached is not None:
             return cached
-        params = {"limit": limit, "order_by": "pnl_7d", "sort": "desc"}
         async with aiohttp.ClientSession() as session:
-            # The old /api/v1 endpoint is retained as a first attempt. GMGN's
-            # public web endpoint has moved to /defi/quotation/v1, so fall back
-            # to the browser-facing leaderboard when the legacy response is
-            # empty or unavailable.
-            payload = await self._request(
-                session, f"{self.gmgn_base}/wallets/{chain}", params
-            )
-            data = payload.get("data", {}) if payload else {}
-            traders = data.get("wallets", []) if isinstance(data, dict) else []
-            if not traders:
-                rank_url = f"{self.gmgn_quotation_base}/rank/{chain}/wallets/7d"
-                rank_params = {
-                    "orderby": "pnl_7d",
-                    "direction": "desc",
-                    "limit": limit,
-                }
-                rank_payload = await self._request(session, rank_url, rank_params)
-                rank_data = rank_payload.get("data", {}) if rank_payload else {}
-                if isinstance(rank_data, dict):
-                    traders = rank_data.get("rank") or rank_data.get("wallets") or []
+            # Use the current browser-facing leaderboard directly. The former
+            # /api/v1/wallets/sol endpoint is obsolete and only creates noisy
+            # 404s before the valid fallback can run.
+            rank_url = f"{self.gmgn_quotation_base}/rank/{chain}/wallets/7d"
+            rank_params = {
+                "orderby": "pnl_7d",
+                "direction": "desc",
+                "limit": limit,
+            }
+            rank_payload = await self._request(session, rank_url, rank_params)
+            rank_data = rank_payload.get("data", {}) if rank_payload else {}
+            traders = []
+            if isinstance(rank_data, dict):
+                traders = rank_data.get("rank") or rank_data.get("wallets") or []
         if not isinstance(traders, list):
             traders = []
         for trader in traders:
