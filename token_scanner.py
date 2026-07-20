@@ -318,7 +318,10 @@ class DexScreenerScanner(TokenSource):
 
     def __init__(self, filters: ScanFilters = None):
         self.filters = filters or ScanFilters()
-        self.api_base = "https://api.dexscreener.com"
+        # DexScreener does not provide a supported public "new pairs" REST
+        # endpoint. Use GeckoTerminal's public new-pools feed for discovery,
+        # then keep DexScreener for enrichment/price data elsewhere.
+        self.api_base = "https://api.geckoterminal.com/api/v2"
         self.running = False
         self.callbacks: List[Callable] = []
 
@@ -342,22 +345,60 @@ class DexScreenerScanner(TokenSource):
                 await asyncio.sleep(30)
 
     async def _scan_new_pairs(self):
-        """Scan for new pairs"""
+        """Scan GeckoTerminal's public Solana new-pools feed."""
         async with aiohttp.ClientSession() as session:
-            # Get recent pairs
-            url = f"{self.api_base}/v1/pairs/solana?sort=createdAt&order=desc&limit=50"
-            async with session.get(url) as resp:
+            url = f"{self.api_base}/networks/solana/new_pools?page=1"
+            async with session.get(url, timeout=10) as resp:
                 if resp.status != 200:
+                    logger.warning("New-pools feed returned HTTP %s", resp.status)
                     return
-
-                data = await resp.json()
-                pairs = data.get("pairs", [])
-
-                for pair in pairs[:10]:  # Process top 10 newest
-                    signal = self._parse_pair(pair)
+                payload = await resp.json()
+                pools = payload.get("data", [])
+                for pool in pools[:20]:
+                    signal = self._parse_gecko_pool(pool)
                     if signal and self._passes_filters(signal):
                         for callback in self.callbacks:
                             await callback(signal)
+
+    def _parse_gecko_pool(self, pool: Dict) -> Optional[TokenSignal]:
+        """Normalize a GeckoTerminal pool into the common signal model."""
+        try:
+            attributes = pool.get("attributes", {})
+            relationships = pool.get("relationships", {})
+            base_data = relationships.get("base_token", {}).get("data", {})
+            mint = str(base_data.get("id", "")).removeprefix("solana_")
+            quote_data = relationships.get("quote_token", {}).get("data", {})
+            quote = str(quote_data.get("id", "")).removeprefix("solana_")
+            if not mint or quote != "So11111111111111111111111111111111111111112":
+                return None
+
+            transactions = attributes.get("transactions", {}).get("h1", {})
+            buys = int(transactions.get("buys", 0) or 0)
+            sells = int(transactions.get("sells", 0) or 0)
+            buyers = int(transactions.get("buyers", 0) or 0)
+            sellers = int(transactions.get("sellers", 0) or 0)
+            total_trades = buys + sells
+            name = str(attributes.get("name", "Unknown / SOL")).split(" / ")[0]
+            market_cap_usd = float(attributes.get("market_cap_usd") or attributes.get("fdv_usd") or 0)
+            liquidity_usd = float(attributes.get("reserve_in_usd") or 0)
+            price_native = float(attributes.get("base_token_price_native_currency") or 0)
+            signal = TokenSignal(
+                mint=mint,
+                name=name,
+                symbol=name,
+                dev_buy_sol=0.0,  # unavailable from pool discovery
+                market_cap_sol=market_cap_usd / 200.0,
+                liquidity_sol=liquidity_usd / 200.0,
+                buy_ratio=buys / max(total_trades, 1),
+                unique_wallets=buyers + sellers,
+                total_trades=total_trades,
+                behavior_data={"data_quality": "pool_snapshot"},
+            )
+            signal.calculate_overall_score()
+            return signal
+        except (TypeError, ValueError, AttributeError) as exc:
+            logger.debug("Could not parse new Gecko pool: %s", exc)
+            return None
 
     def _parse_pair(self, pair: Dict) -> Optional[TokenSignal]:
         """Parse DexScreener pair data"""
