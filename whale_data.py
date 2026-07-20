@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
+import os
 import time
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -49,6 +51,12 @@ class WhaleDataFetcher:
             "Accept": "application/json, text/plain, */*",
             "Referer": "https://gmgn.ai/",
         }
+        self.gmgn_api_key = os.getenv("GMGN_API_KEY", "").strip()
+        self.gmgn_cli_path = os.getenv("GMGN_CLI_PATH", "gmgn-cli")
+        self._activity_by_mint: Dict[str, List[Dict]] = {}
+        self._activity_cache_time = 0.0
+        self._activity_refresh_lock = asyncio.Lock()
+        self._activity_warning_logged = False
         self._init_whale_wallets()
         self._load_learned_wallets()
 
@@ -148,6 +156,143 @@ class WhaleDataFetcher:
     def _set_cache(self, key: str, data: Any, ttl: Optional[int] = None) -> None:
         self._cache[key] = (data, time.time(), ttl or CACHE_TTL.get(key.split(":")[0], 60))
 
+    @staticmethod
+    def _extract_cli_items(payload: Any) -> List[Dict]:
+        """Extract trade records from the CLI's possible response envelopes."""
+        if isinstance(payload, list):
+            return [item for item in payload if isinstance(item, dict)]
+        if not isinstance(payload, dict):
+            return []
+        for key in ("list", "activities", "trades", "data", "result"):
+            value = payload.get(key)
+            if isinstance(value, list):
+                return [item for item in value if isinstance(item, dict)]
+            if isinstance(value, dict):
+                nested = WhaleDataFetcher._extract_cli_items(value)
+                if nested:
+                    return nested
+        return []
+
+    async def _run_gmgn_cli(self, source: str, limit: int = 100) -> List[Dict]:
+        """Read KOL/smart-money trades through the official read-only CLI."""
+        if not self.gmgn_api_key:
+            if not self._activity_warning_logged:
+                logger.warning(
+                    "GMGN_API_KEY is not configured; KOL/smart-money activity is disabled"
+                )
+                self._activity_warning_logged = True
+            return []
+        env = os.environ.copy()
+        env["GMGN_API_KEY"] = self.gmgn_api_key
+        command = [
+            self.gmgn_cli_path,
+            "track",
+            source,
+            "--chain",
+            "sol",
+            "--side",
+            "buy",
+            "--limit",
+            str(limit),
+            "--raw",
+        ]
+        try:
+            process = await asyncio.create_subprocess_exec(
+                *command,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                env=env,
+            )
+            stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=30)
+            if process.returncode != 0:
+                logger.warning(
+                    "GMGN %s feed failed with exit code %s: %s",
+                    source,
+                    process.returncode,
+                    stderr.decode(errors="replace")[-300:],
+                )
+                return []
+            text = stdout.decode(errors="replace").strip()
+            # Some CLI versions print a short status line before JSON.
+            start = min((index for index in (text.find("{"), text.find("[")) if index >= 0), default=-1)
+            if start < 0:
+                return []
+            payload = json.loads(text[start:])
+            return self._extract_cli_items(payload)
+        except FileNotFoundError:
+            logger.warning("GMGN CLI not found at %s", self.gmgn_cli_path)
+        except asyncio.TimeoutError:
+            logger.warning("GMGN %s feed timed out", source)
+        except (json.JSONDecodeError, OSError) as exc:
+            logger.warning("Could not parse GMGN %s feed: %s", source, exc)
+        return []
+
+    @staticmethod
+    def _normalize_activity(item: Dict, source: str) -> Optional[Dict]:
+        mint = (
+            item.get("base_address")
+            or item.get("token_address")
+            or item.get("mint")
+            or (item.get("base_token") or {}).get("address")
+        )
+        wallet = item.get("maker") or item.get("wallet") or item.get("wallet_address")
+        if not mint or not wallet:
+            return None
+        side = str(item.get("side", item.get("event", "buy"))).lower()
+        if side not in {"buy", "bought", "0"}:
+            return None
+        try:
+            amount_usd = float(item.get("amount_usd", item.get("value_usd", 0)) or 0)
+        except (TypeError, ValueError):
+            amount_usd = 0.0
+        try:
+            amount_sol = float(item.get("sol_amount", item.get("amount_sol", 0)) or 0)
+        except (TypeError, ValueError):
+            amount_sol = 0.0
+        if amount_sol <= 0 and amount_usd > 0:
+            # Approximation is only used for the existing SOL threshold; keep
+            # the original USD amount in evidence for later accurate analysis.
+            amount_sol = amount_usd / float(os.getenv("SOL_PRICE_USD", "150"))
+        maker_info = item.get("maker_info") or {}
+        return {
+            "base_address": mint,
+            "address": wallet,
+            "wallet": wallet,
+            "wallet_name": maker_info.get("twitter_username") or source,
+            "source": "kol" if source == "kol" else "gmgn",
+            "sol_amount": amount_sol,
+            "amount_usd": amount_usd,
+            "pnl": item.get("pnl", 0),
+            "win_rate": item.get("win_rate", 0),
+            "timestamp": item.get("timestamp") or item.get("time"),
+            "tags": maker_info.get("tags", []),
+            "is_open_or_close": item.get("is_open_or_close"),
+        }
+
+    async def refresh_activity_feeds(self, limit: int = 100) -> int:
+        """Refresh KOL and smart-money buys once per minute, not per wallet."""
+        if time.time() - self._activity_cache_time < CACHE_TTL["wallet_trades"]:
+            return sum(len(items) for items in self._activity_by_mint.values())
+        async with self._activity_refresh_lock:
+            if time.time() - self._activity_cache_time < CACHE_TTL["wallet_trades"]:
+                return sum(len(items) for items in self._activity_by_mint.values())
+            kol_items, smart_items = await asyncio.gather(
+                self._run_gmgn_cli("kol", limit),
+                self._run_gmgn_cli("smartmoney", limit),
+            )
+            self._activity_by_mint = {}
+            for source, items in (("kol", kol_items), ("smartmoney", smart_items)):
+                for item in items:
+                    activity = self._normalize_activity(item, source)
+                    if activity:
+                        self._activity_by_mint.setdefault(activity["base_address"], []).append(activity)
+                        self.add_wallet(
+                            activity["address"], activity["wallet_name"], activity["source"],
+                            activity.get("sol_amount", 0.5), copy_trade=False,
+                        )
+            self._activity_cache_time = time.time()
+            return sum(len(items) for items in self._activity_by_mint.values())
+
     async def fetch_top_traders(self, chain: str = "sol", limit: int = 50) -> List[Dict]:
         key = f"top_traders:{chain}:{limit}"
         cached = self._get_cache(key)
@@ -224,38 +369,12 @@ class WhaleDataFetcher:
         return positions
 
     async def check_token_buys(self, mint: str, min_sol: float = 0.5) -> List[Dict]:
-        """Check cached/recent wallet history concurrently, with a hard cap."""
-        results: List[Dict] = []
-        wallets = list(self.whale_wallets.values())[:50]
-        semaphore = asyncio.Semaphore(5)
-
-        async def check(wallet: WhaleWallet) -> None:
-            async with semaphore:
-                trades = await self.fetch_wallet_trades(wallet.address, limit=20)
-            for trade in trades:
-                trade_mint = trade.get("mint") or trade.get("token_address")
-                if trade_mint != mint:
-                    continue
-                try:
-                    amount = float(trade.get("sol_amount", trade.get("amount_sol", 0)) or 0)
-                except (TypeError, ValueError):
-                    amount = 0.0
-                if amount < max(float(min_sol), wallet.min_buy_threshold):
-                    continue
-                evidence = {
-                    "address": wallet.address,
-                    "wallet": wallet.address,
-                    "wallet_name": wallet.name,
-                    "source": wallet.source,
-                    "sol_amount": amount,
-                    "pnl": trade.get("pnl", 0),
-                    "win_rate": trade.get("win_rate", 0),
-                    "timestamp": trade.get("time"),
-                }
-                results.append(evidence)
-
-        await asyncio.gather(*(check(wallet) for wallet in wallets), return_exceptions=True)
-        return results
+        """Return cached KOL/smart-money buys for one token."""
+        await self.refresh_activity_feeds(limit=100)
+        return [
+            item for item in self._activity_by_mint.get(mint, [])
+            if float(item.get("sol_amount", 0) or 0) >= float(min_sol)
+        ]
 
     async def get_token_analytics(self, mint: str) -> Dict:
         key = f"token_analytics:{mint}"
@@ -369,8 +488,10 @@ async def get_whale_activity_for_token(mint: str) -> Dict:
 
 async def update_whale_list_from_gmgn(limit: int = 100) -> Dict:
     traders = await whale_fetcher.fetch_top_traders(limit=limit)
+    activity_count = await whale_fetcher.refresh_activity_feeds(limit=100)
     return {
         "count": len(traders),
         "tracked_count": len(whale_fetcher.whale_wallets),
-        "sources": ["GMGN leaderboard"],
+        "activity_count": activity_count,
+        "sources": ["GMGN leaderboard", "GMGN KOL", "GMGN smart-money"],
     }

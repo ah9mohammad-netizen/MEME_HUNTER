@@ -292,8 +292,9 @@ class MemeHunterBot:
                 if not self.paused:
                     result = await update_whale_list_from_gmgn(limit=50)
                     logger.info(
-                        "Whale list refresh: %s new GMGN wallets, %s total tracked",
+                        "Whale refresh: %s new GMGN wallets, %s total tracked, %s activity records",
                         result["count"], result.get("tracked_count", result["count"]),
+                        result.get("activity_count", 0),
                     )
             except Exception as e:
                 logger.error(f"Whale updater error: {e}")

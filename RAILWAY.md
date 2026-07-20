@@ -41,6 +41,8 @@ MAX_COINS_TRACKED=10
 AUTO_LEARN_WALLETS=true
 LEARNED_WALLET_MIN_PROFIT_SOL=0.01
 DATA_DIR=/data
+# Read-only GMGN activity feed (do not add a trading private key)
+GMGN_API_KEY=your_read_only_gmgn_api_key
 
 # Optional
 LOG_LEVEL=INFO

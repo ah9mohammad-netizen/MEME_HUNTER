@@ -165,6 +165,7 @@ Or use environment variables:
 export PAPER_TRADING=true
 export PAPER_STARTING_BALANCE_SOL=1.0
 export DATA_DIR=/data  # derives both SQLite files under the one volume
+export GMGN_API_KEY=your_read_only_gmgn_api_key
 # Only for live mode:
 # export PAPER_TRADING=false
 # export WALLET_PRIVATE_KEY="your_base58_key"
