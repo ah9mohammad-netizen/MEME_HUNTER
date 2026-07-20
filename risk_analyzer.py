@@ -250,20 +250,26 @@ class RiskAnalyzer:
         """Check if token is a honeypot"""
         try:
             async with aiohttp.ClientSession() as session:
-                url = f"{self.goplus_api}/token-security/{mint}"
-                async with session.get(url, timeout=10) as resp:
+                # GoPlus has a separate Solana beta endpoint. The old
+                # /token-security/{mint} route is EVM-shaped and returns 404.
+                url = f"{self.goplus_api}/solana/token_security"
+                params = {"contract_addresses": mint}
+                async with session.get(url, params=params, timeout=10) as resp:
                     if resp.status == 200:
-                        data = await resp.json()
-                        token_data = data.get("data", {})
-
-                        is_honeypot = token_data.get("is_honeypot", False)
-                        honeypot_type = token_data.get("honeypot_type", "none")
-
+                        payload = await resp.json()
+                        token_data = (payload.get("result", {}) or {}).get(mint, {})
+                        if not token_data:
+                            return False, {"available": False}
+                        is_honeypot = str(token_data.get("is_honeypot", "0")) in {"1", "true"}
+                        mintable = str(token_data.get("mintable", {}).get("status", "0"))
+                        freezable = str(token_data.get("freezable", {}).get("status", "0"))
                         return is_honeypot, {
-                            "honeypot_type": honeypot_type,
+                            "honeypot_type": token_data.get("honeypot_type", "none"),
                             "buy_tax": token_data.get("buy_tax", 0),
                             "sell_tax": token_data.get("sell_tax", 0),
-                            "available": True
+                            "has_mint_authority": mintable != "0",
+                            "has_freeze_authority": freezable != "0",
+                            "available": True,
                         }
         except Exception as e:
             logger.warning(f"GoPlus API error for {mint}: {e}")

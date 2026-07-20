@@ -324,9 +324,11 @@ class DexScreenerScanner(TokenSource):
         self.api_base = "https://api.geckoterminal.com/api/v2"
         self.running = False
         self.callbacks: List[Callable] = []
+        self.poll_interval_seconds = 30
+        self.retry_after_seconds = 60
 
     async def connect(self):
-        """No WebSocket needed for DexScreener polling"""
+        """No WebSocket needed for GeckoTerminal polling"""
         self.running = True
         logger.info("DexScreener scanner initialized")
 
@@ -338,11 +340,18 @@ class DexScreenerScanner(TokenSource):
 
         while self.running:
             try:
-                await self._scan_new_pairs()
-                await asyncio.sleep(5)  # Poll every 5 seconds
+                status = await self._scan_new_pairs()
+                if status == 429:
+                    logger.warning(
+                        "New-pools feed rate-limited; backing off %ss",
+                        self.retry_after_seconds,
+                    )
+                    await asyncio.sleep(self.retry_after_seconds)
+                else:
+                    await asyncio.sleep(self.poll_interval_seconds)
             except Exception as e:
                 logger.error(f"Scanner error: {e}")
-                await asyncio.sleep(30)
+                await asyncio.sleep(self.retry_after_seconds)
 
     async def _scan_new_pairs(self):
         """Scan GeckoTerminal's public Solana new-pools feed."""
@@ -351,7 +360,7 @@ class DexScreenerScanner(TokenSource):
             async with session.get(url, timeout=10) as resp:
                 if resp.status != 200:
                     logger.warning("New-pools feed returned HTTP %s", resp.status)
-                    return
+                    return resp.status
                 payload = await resp.json()
                 pools = payload.get("data", [])
                 for pool in pools[:20]:
@@ -359,6 +368,7 @@ class DexScreenerScanner(TokenSource):
                     if signal and self._passes_filters(signal):
                         for callback in self.callbacks:
                             await callback(signal)
+                return 200
 
     def _parse_gecko_pool(self, pool: Dict) -> Optional[TokenSignal]:
         """Normalize a GeckoTerminal pool into the common signal model."""
