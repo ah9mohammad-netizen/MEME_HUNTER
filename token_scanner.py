@@ -245,6 +245,7 @@ class PumpPortalScanner(TokenSource):
             total_trades=data["total_trades"],
             creator_address=data.get("creator_address"),
             behavior_data=behavior,
+            source="pumpfun_new",
         )
         signal.calculate_overall_score()
 
@@ -392,6 +393,7 @@ class DexScreenerScanner(TokenSource):
             market_cap_usd = float(attributes.get("market_cap_usd") or attributes.get("fdv_usd") or 0)
             liquidity_usd = float(attributes.get("reserve_in_usd") or 0)
             price_native = float(attributes.get("base_token_price_native_currency") or 0)
+            dex_id = str(relationships.get("dex", {}).get("data", {}).get("id", ""))
             signal = TokenSignal(
                 mint=mint,
                 name=name,
@@ -402,7 +404,12 @@ class DexScreenerScanner(TokenSource):
                 buy_ratio=buys / max(total_trades, 1),
                 unique_wallets=buyers + sellers,
                 total_trades=total_trades,
-                behavior_data={"data_quality": "pool_snapshot"},
+                behavior_data={
+                    "data_quality": "pool_snapshot",
+                    "migration": dex_id in {"raydium", "pumpswap", "raydium-clmm"},
+                    "dex": dex_id,
+                },
+                source="gecko_new_pool",
             )
             signal.calculate_overall_score()
             return signal

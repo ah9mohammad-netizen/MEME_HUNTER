@@ -83,7 +83,12 @@ Every signal, successful DCA leg and sell fill is written to
 and transaction/paper signature. Position snapshots, portfolio snapshots and
 token outcomes are also saved. The separate `/data/wallets_list.db` contains
 whale/KOL definitions and learned actors. Use
-`/history` and `/learning` in Telegram.
+`/signals`, `/history`, `/performance` and `/learning` in Telegram.
+
+`/performance` compares normal scanner, new-pair, migration, smart-money,
+KOL and social-catalyst observations separately. It reports approval rate,
+entry rate, entry-to-maximum multiple, realized expectancy, drawdown, holding
+time, fees, slippage and false-positive rate.
 
 When a profitable position is closed, wallets associated with that token are
 stored as learned candidates. They are added to the whale tracker as

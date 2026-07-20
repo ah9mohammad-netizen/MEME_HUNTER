@@ -184,6 +184,7 @@ Risk Check: 5 minute cache
 /positions - Active trades
 /pnl       - P&L summary
 /history   - Saved DCA/grid fills
+/performance - Compare strategy types
 /learning  - Learned actor statistics
 /help      - All commands
 ```

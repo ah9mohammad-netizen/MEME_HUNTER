@@ -61,6 +61,7 @@ class StateStore:
                     token_amount REAL NOT NULL DEFAULT 0,
                     price REAL NOT NULL DEFAULT 0,
                     fee_sol REAL NOT NULL DEFAULT 0,
+                    slippage_sol REAL NOT NULL DEFAULT 0,
                     realized_pnl_sol REAL NOT NULL DEFAULT 0,
                     tx_signature TEXT,
                     metadata_json TEXT,
@@ -87,6 +88,32 @@ class StateStore:
                     created_at TEXT NOT NULL
                 );
                 CREATE INDEX IF NOT EXISTS idx_signals_created ON signals(created_at);
+                CREATE TABLE IF NOT EXISTS signal_observations (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    signal_run_id TEXT NOT NULL,
+                    mint TEXT NOT NULL,
+                    symbol TEXT NOT NULL,
+                    strategy_type TEXT NOT NULL,
+                    discovered_at TEXT NOT NULL,
+                    features_json TEXT NOT NULL,
+                    decision TEXT NOT NULL DEFAULT 'discovered',
+                    approved INTEGER NOT NULL DEFAULT 0,
+                    entered INTEGER NOT NULL DEFAULT 0,
+                    entry_price REAL,
+                    max_price REAL,
+                    min_price REAL,
+                    max_multiple REAL,
+                    max_drawdown_pct REAL,
+                    exit_price REAL,
+                    realized_pnl_sol REAL,
+                    fees_sol REAL,
+                    slippage_sol REAL,
+                    hold_seconds REAL,
+                    false_positive INTEGER,
+                    closed_at TEXT,
+                    UNIQUE(signal_run_id, strategy_type)
+                );
+                CREATE INDEX IF NOT EXISTS idx_signal_observations_strategy ON signal_observations(strategy_type);
                 CREATE TABLE IF NOT EXISTS portfolio_snapshots (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     wallet_balance_sol REAL NOT NULL,
@@ -107,6 +134,14 @@ class StateStore:
                 );
                 """
             )
+            # Migrate databases created before slippage tracking was added.
+            columns = {
+                row[1] for row in self._connection.execute("PRAGMA table_info(trade_events)").fetchall()
+            }
+            if "slippage_sol" not in columns:
+                self._connection.execute(
+                    "ALTER TABLE trade_events ADD COLUMN slippage_sol REAL NOT NULL DEFAULT 0"
+                )
 
     @staticmethod
     def _now() -> str:
@@ -188,6 +223,137 @@ class StateStore:
             ).fetchall()
         return [dict(row) for row in rows]
 
+    def ensure_signal_observations(
+        self,
+        *,
+        signal_run_id: str,
+        mint: str,
+        symbol: str,
+        strategy_types: Iterable[str],
+        discovered_at: datetime,
+        features: Optional[Dict[str, Any]] = None,
+        decision: str = "discovered",
+        approved: bool = False,
+    ) -> List[int]:
+        """Create one durable observation row per strategy attribution."""
+        types = sorted(set(strategy_types or ["normal_scanner"]))
+        with self._lock, self._connection:
+            for strategy_type in types:
+                self._connection.execute(
+                    """INSERT INTO signal_observations
+                    (signal_run_id,mint,symbol,strategy_type,discovered_at,features_json,decision,approved)
+                    VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(signal_run_id,strategy_type) DO NOTHING""",
+                    (
+                        signal_run_id, mint, symbol, strategy_type,
+                        discovered_at.isoformat(),
+                        json.dumps(features or {}, default=self._json_default),
+                        decision, int(approved),
+                    ),
+                )
+            rows = self._connection.execute(
+                "SELECT id FROM signal_observations WHERE signal_run_id=?",
+                (signal_run_id,),
+            ).fetchall()
+        return [int(row["id"]) for row in rows]
+
+    def update_signal_observations(
+        self,
+        signal_run_id: str,
+        *,
+        strategy_types: Iterable[str],
+        decision: str,
+        approved: bool,
+        risk_score: Optional[float] = None,
+        features: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """Add final decision context to the rows created at discovery."""
+        with self._lock, self._connection:
+            self._connection.execute(
+                """UPDATE signal_observations SET decision=?,approved=?,features_json=?
+                   WHERE signal_run_id=? AND strategy_type IN ({})""".format(
+                    ",".join("?" for _ in set(strategy_types or ["normal_scanner"]))
+                ),
+                (
+                    decision, int(approved), json.dumps(features or {}, default=self._json_default),
+                    signal_run_id, *sorted(set(strategy_types or ["normal_scanner"])),
+                ),
+            )
+
+    def mark_signal_entry(self, signal_run_id: str, entry_price: float) -> None:
+        with self._lock, self._connection:
+            self._connection.execute(
+                """UPDATE signal_observations SET entered=1,entry_price=?,max_price=?,min_price=?
+                   WHERE signal_run_id=?""",
+                (float(entry_price), float(entry_price), float(entry_price), signal_run_id),
+            )
+
+    def update_signal_market(
+        self,
+        signal_run_id: str,
+        current_price: float,
+        max_price: float,
+        min_price: float,
+        max_drawdown_pct: float,
+    ) -> None:
+        with self._lock, self._connection:
+            self._connection.execute(
+                """UPDATE signal_observations SET max_price=?,min_price=?,max_multiple=CASE
+                   WHEN entry_price > 0 THEN ? / entry_price ELSE NULL END,
+                   max_drawdown_pct=? WHERE signal_run_id=? AND entered=1""",
+                (float(max_price), float(min_price), float(max_price), float(max_drawdown_pct), signal_run_id),
+            )
+
+    def mark_signal_exit(
+        self,
+        signal_run_id: str,
+        *,
+        exit_price: float,
+        realized_pnl_sol: float,
+        fees_sol: float,
+        slippage_sol: float,
+        hold_seconds: float,
+    ) -> None:
+        with self._lock, self._connection:
+            self._connection.execute(
+                """UPDATE signal_observations SET exit_price=?,realized_pnl_sol=?,fees_sol=?,
+                   slippage_sol=?,hold_seconds=?,false_positive=?,closed_at=?
+                   WHERE signal_run_id=? AND entered=1""",
+                (
+                    float(exit_price), float(realized_pnl_sol), float(fees_sol),
+                    float(slippage_sol), float(hold_seconds), int(realized_pnl_sol <= 0),
+                    self._now(), signal_run_id,
+                ),
+            )
+
+    def get_strategy_performance(self) -> List[Dict[str, Any]]:
+        """Return comparable performance metrics for each strategy type."""
+        with self._lock:
+            rows = self._connection.execute(
+                """SELECT strategy_type, COUNT(*) AS signals,
+                   COALESCE(SUM(approved),0) AS approvals,
+                   COALESCE(SUM(entered),0) AS entries,
+                   COALESCE(SUM(realized_pnl_sol),0) AS realized_pnl_sol,
+                   COALESCE(AVG(max_multiple),0) AS avg_entry_to_max_multiple,
+                   COALESCE(AVG(max_drawdown_pct),0) AS avg_max_drawdown_pct,
+                   COALESCE(AVG(hold_seconds),0) AS avg_hold_seconds,
+                   COALESCE(SUM(fees_sol),0) AS fees_sol,
+                   COALESCE(SUM(slippage_sol),0) AS slippage_sol,
+                   COALESCE(SUM(false_positive),0) AS false_positives
+                   FROM signal_observations GROUP BY strategy_type
+                   ORDER BY strategy_type"""
+            ).fetchall()
+        result = []
+        for row in rows:
+            item = dict(row)
+            entries = int(item["entries"] or 0)
+            signals = int(item["signals"] or 0)
+            item["approval_rate_pct"] = (item["approvals"] / signals * 100) if signals else 0.0
+            item["entry_rate_pct"] = (entries / signals * 100) if signals else 0.0
+            item["realized_expectancy_sol"] = (item["realized_pnl_sol"] / entries) if entries else 0.0
+            item["false_positive_rate_pct"] = (item["false_positives"] / entries * 100) if entries else 0.0
+            result.append(item)
+        return result
+
     def record_trade(
         self,
         *,
@@ -200,6 +366,7 @@ class StateStore:
         token_amount: float = 0.0,
         price: float = 0.0,
         fee_sol: float = 0.0,
+        slippage_sol: float = 0.0,
         realized_pnl_sol: float = 0.0,
         tx_signature: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
@@ -208,8 +375,8 @@ class StateStore:
             cursor = self._connection.execute(
                 """INSERT INTO trade_events
                 (position_mint,symbol,side,strategy,reason,sol_amount,token_amount,
-                 price,fee_sol,realized_pnl_sol,tx_signature,metadata_json,created_at)
-                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                 price,fee_sol,slippage_sol,realized_pnl_sol,tx_signature,metadata_json,created_at)
+                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (
                     position_mint,
                     symbol,
@@ -220,6 +387,7 @@ class StateStore:
                     float(token_amount),
                     float(price),
                     float(fee_sol),
+                    float(slippage_sol),
                     float(realized_pnl_sol),
                     tx_signature,
                     json.dumps(metadata or {}, default=self._json_default),
@@ -344,7 +512,13 @@ def position_from_dict(data: Dict[str, Any]) -> Position:
         total_tokens=float(data.get("total_tokens", 0)), remaining_cost_sol=float(data.get("remaining_cost_sol", 0)),
         entry_signal_score=float(data.get("entry_signal_score", 0)),
         associated_wallets=list(data.get("associated_wallets", [])),
-        actor_evidence=list(data.get("actor_evidence", [])), dca_orders=dca_orders,
+        actor_evidence=list(data.get("actor_evidence", [])),
+        signal_run_id=data.get("signal_run_id", ""), strategy_types=list(data.get("strategy_types", [])),
+        signal_features=dict(data.get("signal_features", {})), max_price=float(data.get("max_price", 0)),
+        min_price=float(data.get("min_price", 0)), last_price=float(data.get("last_price", 0)),
+        max_drawdown_pct=float(data.get("max_drawdown_pct", 0)),
+        total_fees_sol=float(data.get("total_fees_sol", 0)), total_slippage_sol=float(data.get("total_slippage_sol", 0)),
+        dca_orders=dca_orders,
         dca_complete=bool(data.get("dca_complete", False)),
         dca_pending_sol=float(data.get("dca_pending_sol", 0.0)), grid_levels=grid_levels,
         grid_sold_pct=float(data.get("grid_sold_pct", 0)), stop_loss_price=float(data.get("stop_loss_price", 0)),

@@ -37,6 +37,7 @@ class TradeResult:
     tokens_received: float = 0.0
     tokens_sold: float = 0.0
     sol_received: float = 0.0
+    slippage_sol: float = 0.0
     price: float = 0.0
     gas_used: float = 0.0
 
@@ -49,7 +50,7 @@ class TradeResult:
         return {
             "success": self.success, "signature": self.signature, "error": self.error,
             "tokens_received": self.tokens_received, "tokens_sold": self.tokens_sold,
-            "sol_received": self.sol_received,
+            "sol_received": self.sol_received, "slippage_sol": self.slippage_sol,
             "price": self.price, "gas_used": self.gas_used,
         }
 
@@ -445,12 +446,14 @@ class PaperTradingClient:
         if price <= 0:
             return TradeResult(success=False, error="No simulated market price available")
         fee = amount * config.TRADING.paper_fee_bps / 10_000
+        slippage_sol = amount * config.TRADING.paper_slippage_bps / 10_000
         execution_price = price * (1 + config.TRADING.paper_slippage_bps / 10_000)
         tokens = max(0.0, amount - fee) / execution_price
         self.balance_sol -= amount
         self.holdings[mint] = self.holdings.get(mint, 0.0) + tokens
         return TradeResult(
             success=True, tokens_received=tokens, price=execution_price, gas_used=fee,
+            slippage_sol=slippage_sol,
             signature=f"paper-buy-{int(datetime.now().timestamp() * 1000000)}",
         )
 
@@ -463,6 +466,7 @@ class PaperTradingClient:
         if price <= 0:
             return TradeResult(success=False, error="No simulated market price available")
         execution_price = price * (1 - config.TRADING.paper_slippage_bps / 10_000)
+        slippage_sol = amount * price * config.TRADING.paper_slippage_bps / 10_000
         gross_proceeds = amount * execution_price
         fee = gross_proceeds * config.TRADING.paper_fee_bps / 10_000
         proceeds = max(0.0, gross_proceeds - fee)
@@ -470,7 +474,8 @@ class PaperTradingClient:
         self.balance_sol += proceeds
         return TradeResult(
             success=True, tokens_sold=amount, sol_received=proceeds, price=execution_price,
-            gas_used=fee, signature=f"paper-sell-{int(datetime.now().timestamp() * 1000000)}",
+            slippage_sol=slippage_sol, gas_used=fee,
+            signature=f"paper-sell-{int(datetime.now().timestamp() * 1000000)}",
         )
 
 

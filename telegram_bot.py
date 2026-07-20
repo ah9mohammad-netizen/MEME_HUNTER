@@ -41,6 +41,7 @@ class TelegramBot:
             "/history": self.cmd_history,
             "/signals": self.cmd_signals,
             "/learning": self.cmd_learning,
+            "/performance": self.cmd_performance,
             "/stop": self.cmd_stop,
             "/resume": self.cmd_resume,
             "/config": self.cmd_config,
@@ -177,6 +178,7 @@ class TelegramBot:
 *Records:*
 /signals - Recent scanner signals
 /history - Recent fills saved in SQLite
+/performance - Strategy-type comparison
 /learning - Learned wallet/token statistics
 /resume - Resume trading
 
@@ -371,6 +373,29 @@ Mode: `{type(self.trading_engine.client).__name__}`
                 f"   {row['reason']} · {row['created_at']}"
             )
         await self.send_message("\n".join(lines))
+
+    async def cmd_performance(self, args):
+        """Compare signal strategy types from the persisted observations."""
+        if not self.trading_engine:
+            await self.send_message("Trading engine not initialized")
+            return
+        rows = self.trading_engine.store.get_strategy_performance()
+        if not rows:
+            await self.send_message("📭 No strategy observations recorded yet.")
+            return
+        lines = ["*📈 STRATEGY PERFORMANCE*"]
+        for row in rows:
+            lines.append(
+                f"*{row['strategy_type']}*\n"
+                f"Signals: {row['signals']} · Approval: {row['approval_rate_pct']:.1f}% · Entries: {row['entries']}\n"
+                f"Expectancy: `{row['realized_expectancy_sol']:+.4f} SOL` · "
+                f"Max: `{row['avg_entry_to_max_multiple']:.2f}x`\n"
+                f"Drawdown: `{row['avg_max_drawdown_pct']:.1f}%` · "
+                f"Hold: `{row['avg_hold_seconds'] / 3600:.1f}h`\n"
+                f"Fees: `{row['fees_sol']:.4f}` · Slippage: `{row['slippage_sol']:.4f}` · "
+                f"False positives: `{row['false_positive_rate_pct']:.1f}%`"
+            )
+        await self.send_message("\n\n".join(lines))
 
     async def cmd_learning(self, args):
         """Show the outcome-learning summary and candidates."""

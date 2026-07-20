@@ -8,7 +8,7 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Set
 from datetime import datetime
 from enum import Enum
-
+from uuid import uuid4
 
 
 class TokenStatus(Enum):
@@ -184,6 +184,17 @@ class Position:
     associated_wallets: List[str] = field(default_factory=list)
     actor_evidence: List[Dict] = field(default_factory=list)
 
+    # Strategy attribution and outcome metrics
+    signal_run_id: str = ""
+    strategy_types: List[str] = field(default_factory=list)
+    signal_features: Dict = field(default_factory=dict)
+    max_price: float = 0.0
+    min_price: float = 0.0
+    last_price: float = 0.0
+    max_drawdown_pct: float = 0.0
+    total_fees_sol: float = 0.0
+    total_slippage_sol: float = 0.0
+
     # DCA tracking
     dca_orders: List[DCAOrder] = field(default_factory=list)
     dca_complete: bool = False
@@ -255,6 +266,12 @@ class TokenSignal:
     # Social signals
     twitter_mentions: int = 0
     telegram_members: int = 0
+
+    # Strategy attribution
+    source: str = "unknown"
+    strategy_types: List[str] = field(default_factory=lambda: ["normal_scanner"])
+    signal_run_id: str = field(default_factory=lambda: uuid4().hex)
+    observation_ids: List[int] = field(default_factory=list)
 
     # Timestamps
     discovered_at: datetime = field(default_factory=datetime.now)

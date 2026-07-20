@@ -309,6 +309,44 @@ class MemeHunterBot:
         except Exception as e:
             logger.error(f"Scanner error: {e}")
 
+    @staticmethod
+    def _classify_signal(signal: TokenSignal, whale_summary: Optional[Dict] = None) -> List[str]:
+        """Assign independent strategy labels; do not collapse them into score."""
+        labels = {"normal_scanner"}
+        if signal.source in {"pumpfun_new", "gecko_new_pool"}:
+            labels.add("new_pair")
+        if signal.behavior_data.get("migration"):
+            labels.add("migration")
+        if signal.twitter_mentions or signal.telegram_members or signal.behavior_data.get("social_catalyst"):
+            labels.add("social_catalyst")
+        summary = whale_summary or {}
+        buys = summary.get("all_buys", [])
+        if any(item.get("source") == "kol" for item in buys):
+            labels.add("kol_confirmation")
+        if any(item.get("source") in {"gmgn", "smartmoney"} for item in buys):
+            labels.add("smart_money_confirmation")
+        return sorted(labels)
+
+    @staticmethod
+    def _signal_features(signal: TokenSignal, whale_summary: Optional[Dict] = None, risk_report=None) -> Dict:
+        summary = whale_summary or {}
+        return {
+            "source": signal.source,
+            "score": signal.overall_score,
+            "dev_buy_sol": signal.dev_buy_sol,
+            "market_cap_sol": signal.market_cap_sol,
+            "liquidity_sol": signal.liquidity_sol,
+            "buy_ratio": signal.buy_ratio,
+            "unique_wallets": signal.unique_wallets,
+            "total_trades": signal.total_trades,
+            "behavior": signal.behavior_data,
+            "risk_score": getattr(risk_report, "overall_score", None),
+            "risk_checks_complete": getattr(risk_report, "checks_complete", None),
+            "whale_sol": summary.get("total_sol", 0.0),
+            "whale_wallet_count": summary.get("wallet_count", 0),
+            "whale_avg_win_rate": summary.get("avg_win_rate", 0.0),
+        }
+
     async def _handle_token_signal(self, signal: TokenSignal):
         """Handle discovered token signal - lightweight version"""
         if signal.mint in self.scanned_mints:
@@ -331,13 +369,32 @@ class MemeHunterBot:
             buy_ratio=signal.buy_ratio, unique_wallets=signal.unique_wallets,
             decision="discovered", reason="initial scanner signal",
         )
+        signal.strategy_types = self._classify_signal(signal)
+        signal.observation_ids = self.store.ensure_signal_observations(
+            signal_run_id=signal.signal_run_id,
+            mint=signal.mint, symbol=signal.symbol,
+            strategy_types=signal.strategy_types,
+            discovered_at=signal.discovered_at,
+            features=self._signal_features(signal),
+            decision="discovered",
+        )
 
         # Skip if score too low or paused
         if self.paused:
+            self.store.update_signal_observations(
+                signal.signal_run_id, strategy_types=signal.strategy_types,
+                decision="paused", approved=False,
+                features=self._signal_features(signal),
+            )
             logger.info(f"   ⏸️ Bot paused, skipping")
             return
 
         if signal.overall_score < 40:
+            self.store.update_signal_observations(
+                signal.signal_run_id, strategy_types=signal.strategy_types,
+                decision="score_filtered", approved=False,
+                features=self._signal_features(signal),
+            )
             logger.info(f"   ⏭️ Score too low, skipping")
             return
 
@@ -396,6 +453,16 @@ class MemeHunterBot:
             if adjustment:
                 logger.info("   🧠 Historical actor adjustment: %+0.1f", adjustment)
 
+        signal.strategy_types = self._classify_signal(signal, whale_summary)
+        signal.observation_ids = self.store.ensure_signal_observations(
+            signal_run_id=signal.signal_run_id,
+            mint=signal.mint, symbol=signal.symbol,
+            strategy_types=signal.strategy_types,
+            discovered_at=signal.discovered_at,
+            features=self._signal_features(signal, whale_summary, risk_report),
+            decision="evaluated",
+        )
+
         # Decision making
         should_trade = False
 
@@ -406,6 +473,14 @@ class MemeHunterBot:
                 should_trade = True
 
         decision = "approved" if should_trade else "rejected"
+        self.store.update_signal_observations(
+            signal.signal_run_id,
+            strategy_types=signal.strategy_types,
+            decision=decision,
+            approved=should_trade,
+            risk_score=risk_report.overall_score,
+            features=self._signal_features(signal, whale_summary, risk_report),
+        )
         self.store.record_signal(
             mint=signal.mint, symbol=signal.symbol, name=signal.name,
             score=signal.overall_score, dev_buy_sol=signal.dev_buy_sol,
@@ -418,6 +493,8 @@ class MemeHunterBot:
                 "whale_count": whale_summary.get("total_buys", 0),
                 "whale_wallet_count": whale_summary.get("wallet_count", 0),
                 "behavior": signal.behavior_data,
+                "strategy_types": signal.strategy_types,
+                "signal_run_id": signal.signal_run_id,
             },
         )
 

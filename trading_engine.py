@@ -85,6 +85,8 @@ class DCAExecutor:
             position.total_invested_sol += order.amount_sol
             position.total_tokens += tokens
             position.remaining_cost_sol += order.amount_sol
+            position.total_fees_sol += float(result_value(result, "gas_used", 0) or 0)
+            position.total_slippage_sol += float(result_value(result, "slippage_sol", 0) or 0)
             self.store.record_trade(
                 position_mint=position.token_mint,
                 symbol=position.token_symbol,
@@ -95,6 +97,7 @@ class DCAExecutor:
                 token_amount=tokens,
                 price=actual_price,
                 fee_sol=float(result_value(result, "gas_used", 0) or 0),
+                slippage_sol=float(result_value(result, "slippage_sol", 0) or 0),
                 tx_signature=order.tx_signature,
             )
             return True
@@ -208,6 +211,8 @@ class DCAExecutor:
             position.total_invested_sol += additional_sol
             position.remaining_cost_sol += additional_sol
             position.total_tokens += tokens
+            position.total_fees_sol += float(result_value(result, "gas_used", 0) or 0)
+            position.total_slippage_sol += float(result_value(result, "slippage_sol", 0) or 0)
             position.grid_initial_tokens += tokens
             position.moon_bag_tokens = position.total_tokens * config.TRADING.moon_bag_pct / 100
             position.entry_price = position.total_invested_sol / position.total_tokens
@@ -215,7 +220,10 @@ class DCAExecutor:
             self.store.record_trade(
                 position_mint=position.token_mint, symbol=position.token_symbol, side="buy",
                 strategy="dca", reason="manual DCA", sol_amount=additional_sol,
-                token_amount=tokens, price=order.actual_price, tx_signature=order.tx_signature,
+                token_amount=tokens, price=order.actual_price,
+                fee_sol=float(result_value(result, "gas_used", 0) or 0),
+                slippage_sol=float(result_value(result, "slippage_sol", 0) or 0),
+                tx_signature=order.tx_signature,
             )
         except Exception as exc:
             order.status = "failed"
@@ -268,6 +276,8 @@ class GridSeller:
                 proceeds = float(result_value(result, "sol_received", 0) or 0)
                 sold_amount = float(result_value(result, "tokens_sold", token_amount) or token_amount)
                 pnl = self._apply_sale(position, sold_amount, proceeds)
+                position.total_fees_sol += float(result_value(result, "gas_used", 0) or 0)
+                position.total_slippage_sol += float(result_value(result, "slippage_sol", 0) or 0)
                 level.status = "triggered"
                 level.triggered_price = current_price
                 level.triggered_at = datetime.now()
@@ -277,7 +287,9 @@ class GridSeller:
                     strategy="grid", reason=f"grid level {level.level}", sol_amount=proceeds,
                     token_amount=sold_amount,
                     price=float(result_value(result, "price", 0) or current_price),
-                    realized_pnl_sol=pnl, fee_sol=float(result_value(result, "gas_used", 0) or 0),
+                    realized_pnl_sol=pnl,
+                    fee_sol=float(result_value(result, "gas_used", 0) or 0),
+                    slippage_sol=float(result_value(result, "slippage_sol", 0) or 0),
                     tx_signature=result_value(result, "signature"),
                 )
                 fills.append({"level": level.level, "proceeds": proceeds, "pnl": pnl})
@@ -362,7 +374,23 @@ class TradingEngine:
             )
             if position is None:
                 return None
+            position.signal_run_id = signal.signal_run_id
+            position.strategy_types = list(signal.strategy_types or ["normal_scanner"])
+            position.signal_features = {
+                "source": signal.source,
+                "score": signal.overall_score,
+                "behavior": signal.behavior_data,
+                "market_cap_sol": signal.market_cap_sol,
+                "liquidity_sol": signal.liquidity_sol,
+                "buy_ratio": signal.buy_ratio,
+                "unique_wallets": signal.unique_wallets,
+                "total_trades": signal.total_trades,
+            }
+            position.max_price = position.entry_price
+            position.min_price = position.entry_price
+            position.last_price = position.entry_price
             self.active_positions[signal.mint] = position
+            self.store.mark_signal_entry(signal.signal_run_id, position.entry_price)
             self.store.save_position(position)
             self.capital_manager.update_after_execution(position.total_invested_sol)
             return position
@@ -404,8 +432,13 @@ class TradingEngine:
             current_price = price_data.get(mint)
             if not current_price or current_price <= 0:
                 continue
+            position.last_price = current_price
             self.momentum_detector.record_price(mint, current_price)
             position.peak_price = max(position.peak_price or position.entry_price, current_price)
+            position.max_price = max(position.max_price or position.entry_price, current_price)
+            position.min_price = min(position.min_price or position.entry_price, current_price)
+            drawdown_pct = (current_price / position.peak_price - 1) * 100 if position.peak_price > 0 else 0.0
+            position.max_drawdown_pct = min(position.max_drawdown_pct, drawdown_pct)
             pending_spend = await self.dca_executor.execute_pending(position, current_price)
             if pending_spend > 0:
                 self.capital_manager.update_after_execution(pending_spend)
@@ -430,6 +463,11 @@ class TradingEngine:
             if position.trailing_stop_active and current_price <= position.trailing_stop_price:
                 await self._emergency_exit(position, "Trailing stop triggered")
                 continue
+            if position.signal_run_id:
+                self.store.update_signal_market(
+                    position.signal_run_id, current_price, position.max_price,
+                    position.min_price, position.max_drawdown_pct,
+                )
             self._save(position)
 
     async def _sell_all(self, position: Position, reason: str, slippage_bps: Optional[int] = None) -> bool:
@@ -443,13 +481,18 @@ class TradingEngine:
             logger.error("Could not close %s: %s", position.token_symbol, result_value(result, "error", "unknown"))
             return False
         amount = float(result_value(result, "tokens_sold", position.total_tokens) or position.total_tokens)
+        position.last_price = float(result_value(result, "price", position.last_price or position.entry_price) or position.last_price or position.entry_price)
         proceeds = float(result_value(result, "sol_received", 0) or 0)
         pnl = GridSeller._apply_sale(position, amount, proceeds)
+        position.total_fees_sol += float(result_value(result, "gas_used", 0) or 0)
+        position.total_slippage_sol += float(result_value(result, "slippage_sol", 0) or 0)
         self.store.record_trade(
             position_mint=position.token_mint, symbol=position.token_symbol, side="sell",
             strategy="risk_exit", reason=reason, sol_amount=proceeds, token_amount=amount,
             price=float(result_value(result, "price", 0) or 0), realized_pnl_sol=pnl,
-            fee_sol=float(result_value(result, "gas_used", 0) or 0), tx_signature=result_value(result, "signature"),
+            fee_sol=float(result_value(result, "gas_used", 0) or 0),
+            slippage_sol=float(result_value(result, "slippage_sol", 0) or 0),
+            tx_signature=result_value(result, "signature"),
         )
         self.capital_manager.update_after_receipt(proceeds)
         return True
@@ -457,6 +500,19 @@ class TradingEngine:
     async def _finalize(self, position: Position, reason: str) -> None:
         position.status = TokenStatus.CLOSED
         position.moon_bag_tokens = 0
+        position.unrealized_pnl_sol = 0.0
+        position.unrealized_pnl_pct = 0.0
+        exit_price = position.last_price or position.entry_price
+        hold_seconds = max(0.0, (datetime.now() - position.opened_at).total_seconds())
+        if position.signal_run_id:
+            self.store.mark_signal_exit(
+                position.signal_run_id,
+                exit_price=exit_price,
+                realized_pnl_sol=position.realized_pnl_sol,
+                fees_sol=position.total_fees_sol,
+                slippage_sol=position.total_slippage_sol,
+                hold_seconds=hold_seconds,
+            )
         self._save(position)
         self.learner.record_closed_position(position, reason)
         self.active_positions.pop(position.token_mint, None)
