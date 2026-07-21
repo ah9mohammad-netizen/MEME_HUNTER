@@ -328,6 +328,31 @@ class MemeHunterBot:
         return sorted(labels)
 
     @staticmethod
+    def _rejection_reason(signal: TokenSignal, risk_report=None, whale_summary: Optional[Dict] = None) -> str:
+        if risk_report is None:
+            return "score_below_40"
+        if not getattr(risk_report, "checks_complete", False):
+            return "risk_data_unavailable"
+        for flag, reason in (
+            ("is_honeypot", "honeypot"),
+            ("is_rugged", "rugged"),
+            ("high_concentration", "holder_concentration"),
+            ("developer_cluster", "developer_cluster"),
+            ("wash_trading_suspected", "wash_trading"),
+            ("bundle_risk_suspected", "bundle_risk"),
+            ("creator_sold_early", "creator_sold"),
+        ):
+            if getattr(risk_report, flag, False):
+                return reason
+        if risk_report.overall_score < 50:
+            return "risk_score_below_50"
+        if signal.overall_score < 60 and not signal.is_whale_alert:
+            return "opportunity_score_below_60"
+        if signal.is_whale_alert and (whale_summary or {}).get("total_sol", 0) < 2:
+            return "smart_money_amount_below_2_sol"
+        return "not_approved"
+
+    @staticmethod
     def _signal_features(signal: TokenSignal, whale_summary: Optional[Dict] = None, risk_report=None) -> Dict:
         summary = whale_summary or {}
         return {
@@ -384,6 +409,7 @@ class MemeHunterBot:
             self.store.update_signal_observations(
                 signal.signal_run_id, strategy_types=signal.strategy_types,
                 decision="paused", approved=False,
+                rejection_reason="bot_paused",
                 features=self._signal_features(signal),
             )
             logger.info(f"   ⏸️ Bot paused, skipping")
@@ -393,6 +419,7 @@ class MemeHunterBot:
             self.store.update_signal_observations(
                 signal.signal_run_id, strategy_types=signal.strategy_types,
                 decision="score_filtered", approved=False,
+                rejection_reason="score_below_40",
                 features=self._signal_features(signal),
             )
             logger.info(f"   ⏭️ Score too low, skipping")
@@ -479,6 +506,7 @@ class MemeHunterBot:
             decision=decision,
             approved=should_trade,
             risk_score=risk_report.overall_score,
+            rejection_reason=None if should_trade else self._rejection_reason(signal, risk_report, whale_summary),
             features=self._signal_features(signal, whale_summary, risk_report),
         )
         self.store.record_signal(

@@ -185,6 +185,7 @@ Risk Check: 5 minute cache
 /pnl       - P&L summary
 /history   - Saved DCA/grid fills
 /performance - Compare strategy types
+/rejections - Show signal rejection reasons
 /learning  - Learned actor statistics
 /help      - All commands
 ```

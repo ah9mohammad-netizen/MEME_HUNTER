@@ -97,6 +97,7 @@ class StateStore:
                     discovered_at TEXT NOT NULL,
                     features_json TEXT NOT NULL,
                     decision TEXT NOT NULL DEFAULT 'discovered',
+                    rejection_reason TEXT,
                     approved INTEGER NOT NULL DEFAULT 0,
                     entered INTEGER NOT NULL DEFAULT 0,
                     entry_price REAL,
@@ -141,6 +142,15 @@ class StateStore:
             if "slippage_sol" not in columns:
                 self._connection.execute(
                     "ALTER TABLE trade_events ADD COLUMN slippage_sol REAL NOT NULL DEFAULT 0"
+                )
+            observation_columns = {
+                row[1] for row in self._connection.execute(
+                    "PRAGMA table_info(signal_observations)"
+                ).fetchall()
+            }
+            if "rejection_reason" not in observation_columns:
+                self._connection.execute(
+                    "ALTER TABLE signal_observations ADD COLUMN rejection_reason TEXT"
                 )
 
     @staticmethod
@@ -265,17 +275,18 @@ class StateStore:
         approved: bool,
         risk_score: Optional[float] = None,
         features: Optional[Dict[str, Any]] = None,
+        rejection_reason: Optional[str] = None,
     ) -> None:
         """Add final decision context to the rows created at discovery."""
         with self._lock, self._connection:
             self._connection.execute(
-                """UPDATE signal_observations SET decision=?,approved=?,features_json=?
+                """UPDATE signal_observations SET decision=?,approved=?,features_json=?,rejection_reason=?
                    WHERE signal_run_id=? AND strategy_type IN ({})""".format(
                     ",".join("?" for _ in set(strategy_types or ["normal_scanner"]))
                 ),
                 (
                     decision, int(approved), json.dumps(features or {}, default=self._json_default),
-                    signal_run_id, *sorted(set(strategy_types or ["normal_scanner"])),
+                    rejection_reason, signal_run_id, *sorted(set(strategy_types or ["normal_scanner"])),
                 ),
             )
 
@@ -324,6 +335,34 @@ class StateStore:
                     self._now(), signal_run_id,
                 ),
             )
+
+    def get_rejection_report(self) -> Dict[str, Any]:
+        """Summarize why signals did not reach a paper entry."""
+        with self._lock:
+            totals = self._connection.execute(
+                """SELECT COUNT(DISTINCT signal_run_id) AS total,
+                   COUNT(DISTINCT CASE WHEN approved=1 THEN signal_run_id END) AS approved,
+                   COUNT(DISTINCT CASE WHEN decision='score_filtered' THEN signal_run_id END) AS score_filtered,
+                   COUNT(DISTINCT CASE WHEN decision='rejected' THEN signal_run_id END) AS rejected,
+                   COUNT(DISTINCT CASE WHEN decision='paused' THEN signal_run_id END) AS paused
+                   FROM signal_observations"""
+            ).fetchone()
+            rows = self._connection.execute(
+                """SELECT COALESCE(rejection_reason, decision) AS reason,
+                   COUNT(DISTINCT signal_run_id) AS signals
+                   FROM signal_observations
+                   WHERE approved=0 AND decision IN ('score_filtered','rejected','paused')
+                   GROUP BY COALESCE(rejection_reason, decision)
+                   ORDER BY signals DESC"""
+            ).fetchall()
+        return {
+            "total_signals": int(totals["total"] or 0),
+            "approved": int(totals["approved"] or 0),
+            "score_filtered": int(totals["score_filtered"] or 0),
+            "risk_rejected": int(totals["rejected"] or 0),
+            "paused": int(totals["paused"] or 0),
+            "reasons": [dict(row) for row in rows],
+        }
 
     def get_strategy_performance(self) -> List[Dict[str, Any]]:
         """Return comparable performance metrics for each strategy type."""

@@ -42,6 +42,7 @@ class TelegramBot:
             "/signals": self.cmd_signals,
             "/learning": self.cmd_learning,
             "/performance": self.cmd_performance,
+            "/rejections": self.cmd_rejections,
             "/stop": self.cmd_stop,
             "/resume": self.cmd_resume,
             "/config": self.cmd_config,
@@ -179,6 +180,7 @@ class TelegramBot:
 /signals - Recent scanner signals
 /history - Recent fills saved in SQLite
 /performance - Strategy-type comparison
+/rejections - Why signals were rejected
 /learning - Learned wallet/token statistics
 /resume - Resume trading
 
@@ -372,6 +374,31 @@ Mode: `{type(self.trading_engine.client).__name__}`
                 f"{row['sol_amount']:.4f} SOL · {row['strategy']}\n"
                 f"   {row['reason']} · {row['created_at']}"
             )
+        await self.send_message("\n".join(lines))
+
+    async def cmd_rejections(self, args):
+        """Show rejection totals and the exact reason breakdown."""
+        if not self.trading_engine:
+            await self.send_message("Trading engine not initialized")
+            return
+        report = self.trading_engine.store.get_rejection_report()
+        lines = [
+            "*🚫 SIGNAL REJECTIONS*",
+            f"Total signals: `{report['total_signals']}`",
+            f"Approved: `{report['approved']}`",
+            f"Score filtered (<40): `{report['score_filtered']}`",
+            f"Risk/decision rejected: `{report['risk_rejected']}`",
+            f"Paused: `{report['paused']}`",
+            "",
+            "*Reasons:*",
+        ]
+        if report["reasons"]:
+            lines.extend(
+                f"• `{item['reason']}`: `{item['signals']}`"
+                for item in report["reasons"]
+            )
+        else:
+            lines.append("No rejection reasons recorded yet.")
         await self.send_message("\n".join(lines))
 
     async def cmd_performance(self, args):
