@@ -118,13 +118,22 @@ class WalletStore:
                 ),
             )
 
-    def get_wallet_candidates(self, limit: int = 100) -> List[Dict[str, Any]]:
+    def get_wallet_candidates(
+        self, limit: int = 100, source: Optional[str] = None
+    ) -> List[Dict[str, Any]]:
         with self._lock:
-            rows = self._connection.execute(
-                """SELECT * FROM wallets WHERE enabled=1
-                   ORDER BY profitable_observations DESC,total_pnl_sol DESC LIMIT ?""",
-                (int(limit),),
-            ).fetchall()
+            if source:
+                rows = self._connection.execute(
+                    """SELECT * FROM wallets WHERE enabled=1 AND source=?
+                       ORDER BY profitable_observations DESC,total_pnl_sol DESC LIMIT ?""",
+                    (source, int(limit)),
+                ).fetchall()
+            else:
+                rows = self._connection.execute(
+                    """SELECT * FROM wallets WHERE enabled=1
+                       ORDER BY profitable_observations DESC,total_pnl_sol DESC LIMIT ?""",
+                    (int(limit),),
+                ).fetchall()
         return [dict(row) for row in rows]
 
     def get_wallet(self, address: str) -> Optional[Dict[str, Any]]:

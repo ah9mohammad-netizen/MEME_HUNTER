@@ -403,7 +403,9 @@ Mode: `{type(self.trading_engine.client).__name__}`
             await self.send_message("Trading engine not initialized")
             return
         summary = self.trading_engine.learner.summary()
-        candidates = self.trading_engine.learner.wallet_store.get_wallet_candidates(limit=5)
+        candidates = self.trading_engine.learner.wallet_store.get_wallet_candidates(
+            limit=5, source="learned"
+        )
         lines = [
             "*🧠 LEARNING*",
             f"Closed tokens: `{summary['closed_tokens']}`",
@@ -412,11 +414,14 @@ Mode: `{type(self.trading_engine.client).__name__}`
             "",
             "Candidates are alert-only (never auto-copy):",
         ]
-        lines.extend(
-            f"• `{item['address'][:10]}…` {item['name']} — "
-            f"{item['profitable_observations']} profitable observation(s)"
-            for item in candidates
-        )
+        if candidates:
+            lines.extend(
+                f"• `{item['address'][:10]}…` {item['name']} — "
+                f"{item['profitable_observations']} profitable observation(s)"
+                for item in candidates
+            )
+        else:
+            lines.append("No learned wallet candidates yet.")
         await self.send_message("\n".join(lines))
 
     async def cmd_stop(self, args):
