@@ -332,7 +332,8 @@ class MemeHunterBot:
         if risk_report is None:
             return "score_below_40"
         if not getattr(risk_report, "checks_complete", False):
-            return "risk_data_unavailable"
+            missing = getattr(risk_report, "unavailable_checks", [])
+            return "risk_data_unavailable:" + (",".join(missing) if missing else "unknown")
         for flag, reason in (
             ("is_honeypot", "honeypot"),
             ("is_rugged", "rugged"),
@@ -367,6 +368,8 @@ class MemeHunterBot:
             "behavior": signal.behavior_data,
             "risk_score": getattr(risk_report, "overall_score", None),
             "risk_checks_complete": getattr(risk_report, "checks_complete", None),
+            "risk_check_status": getattr(risk_report, "check_status", {}),
+            "risk_unavailable_checks": getattr(risk_report, "unavailable_checks", []),
             "whale_sol": summary.get("total_sol", 0.0),
             "whale_wallet_count": summary.get("wallet_count", 0),
             "whale_avg_win_rate": summary.get("avg_win_rate", 0.0),
@@ -433,7 +436,8 @@ class MemeHunterBot:
         logger.info(
             f"   📊 Risk Analysis:\n"
             f"   Risk Score: {risk_report.overall_score:.1f}/100\n"
-            f"   Recommendation: {risk_report.get_recommendation()}"
+            f"   Recommendation: {risk_report.get_recommendation()}\n"
+            f"   Data: {risk_report.check_status or {}}"
         )
 
         if risk_report.warnings:

@@ -41,6 +41,8 @@ class RiskReport:
 
     # Data-quality and behavioral warnings
     checks_complete: bool = False
+    check_status: Dict[str, bool] = None
+    unavailable_checks: List[str] = None
     behavior_data_available: bool = False
     wash_trading_suspected: bool = False
     bundle_risk_suspected: bool = False
@@ -62,6 +64,10 @@ class RiskReport:
     def __post_init__(self):
         if self.warnings is None:
             self.warnings = []
+        if self.check_status is None:
+            self.check_status = {}
+        if self.unavailable_checks is None:
+            self.unavailable_checks = []
         if self.analyzed_at is None:
             self.analyzed_at = datetime.now()
 
@@ -149,7 +155,16 @@ class RiskAnalyzer:
         # Update report
         report.is_honeypot = is_honeypot
         required_checks = [contract_data, honeypot_data, liquidity_data, holder_data]
-        report.checks_complete = all(bool(item.get("available", False)) for item in required_checks)
+        report.check_status = {
+            "contract": bool(contract_data.get("available", False)),
+            "honeypot": bool(honeypot_data.get("available", False)),
+            "liquidity": bool(liquidity_data.get("available", False)),
+            "holders": bool(holder_data.get("available", False)),
+        }
+        report.unavailable_checks = [
+            name for name, available in report.check_status.items() if not available
+        ]
+        report.checks_complete = not report.unavailable_checks
         report.has_mint_authority = contract_data.get("has_mint_authority", True)
         report.has_freeze_authority = contract_data.get("has_freeze_authority", True)
 
