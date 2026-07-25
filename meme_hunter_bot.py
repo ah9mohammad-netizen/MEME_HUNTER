@@ -156,6 +156,7 @@ class MemeHunterBot:
             "PAPER_FEE_BPS": ("paper_fee_bps", int),
             "PAPER_SLIPPAGE_BPS": ("paper_slippage_bps", int),
             "MIN_CONFIRMING_WHALES": ("min_confirming_whales", int),
+            "GMGN_TOKEN_ENRICH_PER_HOUR": ("gmgn_token_enrich_per_hour", int),
             "LEARNED_WALLET_MIN_PROFIT_SOL": ("learned_wallet_min_profit_sol", float),
             "TRADE_HISTORY_DB_PATH": ("trade_history_db_path", str),
             "WALLETS_DB_PATH": ("wallets_db_path", str),
@@ -375,6 +376,55 @@ class MemeHunterBot:
             "whale_avg_win_rate": summary.get("avg_win_rate", 0.0),
         }
 
+    async def _enrich_signal_from_gmgn(self, signal: TokenSignal) -> bool:
+        """Use a small, rate-limited GMGN token snapshot for near-threshold pools."""
+        if signal.source != "gecko_new_pool" or not (30 <= signal.overall_score < 45):
+            return False
+        if signal.liquidity_sol < config.TRADING.min_liquidity_usd / 200:
+            return False
+        info = await whale_fetcher.fetch_token_info(signal.mint)
+        if not info:
+            return False
+        # CLI versions may wrap the token object in data/token/stat/security.
+        token = info.get("token", info.get("data", info)) if isinstance(info, dict) else {}
+        if isinstance(token, dict) and isinstance(token.get("data"), dict):
+            token = token["data"]
+        if not isinstance(token, dict):
+            return False
+        top10 = token.get("top_10_holder_rate")
+        try:
+            top10 = float(top10) if top10 is not None else None
+        except (TypeError, ValueError):
+            top10 = None
+        quality = 0.0
+        if str(token.get("renounced_mint", token.get("mintable", "0"))) in {"1", "true"}:
+            quality += 2.0
+        if str(token.get("renounced_freeze_account", token.get("freezable", "0"))) in {"1", "true"}:
+            quality += 2.0
+        if top10 is not None and top10 < 0.30:
+            quality += 3.0
+        if float(token.get("holder_count", 0) or 0) >= 100:
+            quality += 2.0
+        if str(token.get("is_honeypot", "0")) in {"0", "false"}:
+            quality += 1.0
+        signal.behavior_data.update({
+            "gmgn_quality_score": quality,
+            "gmgn_top10_holder_rate": top10,
+            "gmgn_holder_count": token.get("holder_count"),
+            "bundler_rate": token.get("bundler_rate"),
+            "smart_degen_count": token.get("smart_degen_count"),
+            "is_wash_trading": token.get("is_wash_trading"),
+            "creator_close": token.get("creator_close"),
+            "gmgn_enriched": True,
+        })
+        if top10 is not None:
+            signal.behavior_data["bundle_risk_score"] = max(
+                float(signal.behavior_data.get("bundle_risk_score", 0) or 0),
+                min(100.0, top10 * 100.0),
+            )
+        signal.calculate_overall_score()
+        return True
+
     async def _handle_token_signal(self, signal: TokenSignal):
         """Handle discovered token signal - lightweight version"""
         if signal.mint in self.scanned_mints:
@@ -406,6 +456,20 @@ class MemeHunterBot:
             features=self._signal_features(signal),
             decision="discovered",
         )
+
+        # Enrich near-threshold Gecko pools before the score gate. This is
+        # deliberately rate-limited so GMGN credits are not spent on every
+        # low-quality launch.
+        if not self.paused:
+            enriched = await self._enrich_signal_from_gmgn(signal)
+            if enriched:
+                self.store.update_signal_observations(
+                    signal.signal_run_id,
+                    strategy_types=signal.strategy_types,
+                    decision="enriched",
+                    approved=False,
+                    features=self._signal_features(signal),
+                )
 
         # Skip if score too low or paused
         if self.paused:

@@ -296,6 +296,7 @@ class TokenSignal:
         quality = (
             min(max(self.dev_buy_sol, 0.0) / 2.0, 1.0) * 10.0
             + min(max(self.liquidity_sol, 0.0) / 50.0, 1.0) * 10.0
+            + min(max(float((self.behavior_data or {}).get("gmgn_quality_score", 0) or 0), 0.0), 10.0)
         )
 
         # Opportunity: 25 points, capped at the configured scanner range.

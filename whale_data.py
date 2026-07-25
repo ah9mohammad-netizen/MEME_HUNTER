@@ -13,6 +13,7 @@ from typing import Any, Dict, List, Optional
 
 import aiohttp
 
+from config import config
 from wallet_store import WalletStore
 
 logger = logging.getLogger(__name__)
@@ -57,6 +58,7 @@ class WhaleDataFetcher:
         self._activity_cache_time = 0.0
         self._activity_refresh_lock = asyncio.Lock()
         self._activity_warning_logged = False
+        self._token_enrichment_times: List[float] = []
         self._init_whale_wallets()
         self._load_learned_wallets()
 
@@ -226,6 +228,53 @@ class WhaleDataFetcher:
         except (json.JSONDecodeError, OSError) as exc:
             logger.warning("Could not parse GMGN %s feed: %s", source, exc)
         return []
+
+    async def fetch_token_info(self, mint: str) -> Dict[str, Any]:
+        """Fetch one cached GMGN token/security snapshot for enrichment."""
+        key = f"gmgn_token_info:{mint}"
+        cached = self._get_cache(key)
+        if cached is not None:
+            return cached
+        now = time.time()
+        self._token_enrichment_times = [stamp for stamp in self._token_enrichment_times if now - stamp < 3600]
+        if len(self._token_enrichment_times) >= config.TRADING.gmgn_token_enrich_per_hour:
+            return {}
+        if not self.gmgn_api_key:
+            return {}
+        self._token_enrichment_times.append(now)
+        env = os.environ.copy()
+        env["GMGN_API_KEY"] = self.gmgn_api_key
+        command = [
+            self.gmgn_cli_path, "token", "info", "--chain", "sol",
+            "--address", mint, "--raw",
+        ]
+        try:
+            process = await asyncio.create_subprocess_exec(
+                *command, stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE, env=env,
+            )
+            stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=20)
+            if process.returncode != 0:
+                logger.debug("GMGN token info failed for %s: %s", mint[:12], stderr.decode(errors="replace")[-200:])
+                return {}
+            text = stdout.decode(errors="replace").strip()
+            start = min((index for index in (text.find("{"), text.find("[")) if index >= 0), default=-1)
+            if start < 0:
+                return {}
+            payload = json.loads(text[start:])
+            items = self._extract_cli_items(payload)
+            if items:
+                result = items[0]
+            elif isinstance(payload, dict):
+                result = payload.get("data", payload.get("result", payload))
+            else:
+                result = {}
+            result = result if isinstance(result, dict) else {}
+            self._set_cache(key, result, ttl=60)
+            return result
+        except (FileNotFoundError, asyncio.TimeoutError, json.JSONDecodeError, OSError) as exc:
+            logger.debug("Could not enrich %s from GMGN: %s", mint[:12], exc)
+            return {}
 
     @staticmethod
     def _normalize_activity(item: Dict, source: str) -> Optional[Dict]:

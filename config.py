@@ -59,6 +59,7 @@ class TradingConfig:
 
     # Smart-money confirmation must be convergent by default.
     min_confirming_whales: int = 2
+    gmgn_token_enrich_per_hour: int = 50
 
     # Indicators & filters
     min_liquidity_usd: float = 5000.0
