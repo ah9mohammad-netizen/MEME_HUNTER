@@ -152,6 +152,29 @@ class RiskAnalyzer:
         holders_ok, holder_data = results[3] if isinstance(results[3], tuple) else (True, {})
         dev_ok, dev_data = results[4] if isinstance(results[4], tuple) else (True, {})
 
+        if not liquidity_data.get("available") and market_data:
+            snapshot_liquidity = float(market_data.get("liquidity_usd", 0) or 0)
+            if snapshot_liquidity > 0:
+                liquidity_data = {
+                    "available": True,
+                    "liquidity_usd": snapshot_liquidity,
+                    "lp_locked": False,
+                    "lock_pct": 0,
+                    "source": "signal_snapshot",
+                }
+
+        # GoPlus also returns holder concentration. Use it as a fallback when
+        # the public Solana RPC is rate-limited, while preserving the source
+        # in the diagnostic payload.
+        if not holder_data.get("available") and honeypot_data.get("available") and "top_10_pct" in honeypot_data:
+            holder_data = {
+                "available": True,
+                "top_10_pct": honeypot_data.get("top_10_pct", 0),
+                "dev_pct": 0,
+                "has_cluster": False,
+                "source": "goplus_fallback",
+            }
+
         # Update report
         report.is_honeypot = is_honeypot
         required_checks = [contract_data, honeypot_data, liquidity_data, holder_data]
@@ -239,7 +262,7 @@ class RiskAnalyzer:
         """Check contract safety via RugCheck"""
         try:
             async with aiohttp.ClientSession() as session:
-                url = f"{self.rugcheck_api}/tokens/{mint}/reports"
+                url = f"{self.rugcheck_api}/tokens/{mint}/report"
                 async with session.get(url, timeout=10) as resp:
                     if resp.status == 200:
                         data = await resp.json()
@@ -278,12 +301,19 @@ class RiskAnalyzer:
                         is_honeypot = str(token_data.get("is_honeypot", "0")) in {"1", "true"}
                         mintable = str(token_data.get("mintable", {}).get("status", "0"))
                         freezable = str(token_data.get("freezable", {}).get("status", "0"))
+                        holders = token_data.get("holders", []) or []
+                        top10_pct = sum(
+                            float(holder.get("percent", 0) or 0) * 100
+                            for holder in holders[:10]
+                        )
                         return is_honeypot, {
                             "honeypot_type": token_data.get("honeypot_type", "none"),
                             "buy_tax": token_data.get("buy_tax", 0),
                             "sell_tax": token_data.get("sell_tax", 0),
                             "has_mint_authority": mintable != "0",
                             "has_freeze_authority": freezable != "0",
+                            "holder_count": int(token_data.get("holder_count", 0) or 0),
+                            "top_10_pct": top10_pct,
                             "available": True,
                         }
         except Exception as e:

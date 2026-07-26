@@ -494,7 +494,12 @@ class MemeHunterBot:
 
         # Perform risk analysis
         risk_report = await self.risk_analyzer.analyze(
-            signal.mint, behavior_data=signal.behavior_data
+            signal.mint,
+            market_data={
+                "liquidity_usd": signal.liquidity_sol * 200,
+                "market_cap_usd": signal.market_cap_sol * 200,
+            },
+            behavior_data=signal.behavior_data,
         )
 
         logger.info(
