@@ -126,6 +126,7 @@ class MemeHunterBot:
         self.paused = False
         self.approved_tokens: Dict[str, TokenSignal] = {}
         self.scanned_mints: set = set()
+        self.pending_signals: Dict[str, TokenSignal] = {}
 
         # Price tracking (minimal)
         self.current_prices: Dict[str, float] = {}
@@ -143,6 +144,9 @@ class MemeHunterBot:
             "MAX_PORTFOLIO_ALLOCATION_PCT": ("max_portfolio_allocation_pct", float),
             "MIN_SOL_RESERVE": ("min_sol_reserve", float),
             "MIN_TRADE_SOL": ("min_trade_sol", float),
+            "MIN_MARKET_CAP_USD": ("min_market_cap_usd", float),
+            "SIGNAL_RECHECK_INTERVAL_SECONDS": ("signal_recheck_interval_seconds", int),
+            "SIGNAL_RECHECK_MAX_AGE_SECONDS": ("signal_recheck_max_age_seconds", int),
             "MAX_COINS_TRACKED": ("max_coins_tracked", int),
             "DCA_ENTRIES": ("dca_entries", int),
             "DCA_SPACING_PCT": ("dca_spacing_pct", float),
@@ -238,6 +242,7 @@ class MemeHunterBot:
         # Initialize scanners
         filters = ScanFilters(
             min_dev_buy_sol=config.TRADING.min_dev_buy_sol,
+            min_market_cap_sol=config.TRADING.min_market_cap_usd / 200,
             max_market_cap_sol=50.0,
             min_liquidity_sol=config.TRADING.min_liquidity_usd / 200,
             min_unique_wallets=config.TRADING.min_unique_wallets,
@@ -272,6 +277,7 @@ class MemeHunterBot:
             self._run_price_monitor(),
             self._run_position_monitor(),
             self._run_balance_monitor(),
+            self._run_signal_recheck(),
             self._run_whale_updater(),      # Lightweight: updates whale list periodically
             self._run_status_reporting()
         ]
@@ -348,6 +354,8 @@ class MemeHunterBot:
                 return reason
         if risk_report.overall_score < 50:
             return "risk_score_below_50"
+        if signal.source == "gecko_new_pool" and not signal.behavior_data.get("gmgn_enriched"):
+            return "launch_quality_data_unavailable"
         if signal.overall_score < 60 and not signal.is_whale_alert:
             return "opportunity_score_below_60"
         if signal.is_whale_alert and (whale_summary or {}).get("total_sol", 0) < 2:
@@ -378,7 +386,7 @@ class MemeHunterBot:
 
     async def _enrich_signal_from_gmgn(self, signal: TokenSignal) -> bool:
         """Use a small, rate-limited GMGN token snapshot for near-threshold pools."""
-        if signal.source != "gecko_new_pool" or not (30 <= signal.overall_score < 45):
+        if signal.source != "gecko_new_pool" or not (30 <= signal.overall_score < 70):
             return False
         if signal.liquidity_sol < config.TRADING.min_liquidity_usd / 200:
             return False
@@ -425,9 +433,9 @@ class MemeHunterBot:
         signal.calculate_overall_score()
         return True
 
-    async def _handle_token_signal(self, signal: TokenSignal):
-        """Handle discovered token signal - lightweight version"""
-        if signal.mint in self.scanned_mints:
+    async def _handle_token_signal(self, signal: TokenSignal, allow_recheck: bool = False):
+        """Handle or re-evaluate a discovered token signal."""
+        if signal.mint in self.scanned_mints and not allow_recheck:
             return
 
         self.scanned_mints.add(signal.mint)
@@ -440,22 +448,23 @@ class MemeHunterBot:
             f"   Buy Ratio: {signal.buy_ratio:.1%}\n"
             f"   Score: {signal.overall_score:.1f}"
         )
-        self.store.record_signal(
-            mint=signal.mint, symbol=signal.symbol, name=signal.name,
-            score=signal.overall_score, dev_buy_sol=signal.dev_buy_sol,
-            market_cap_sol=signal.market_cap_sol, liquidity_sol=signal.liquidity_sol,
-            buy_ratio=signal.buy_ratio, unique_wallets=signal.unique_wallets,
-            decision="discovered", reason="initial scanner signal",
-        )
-        signal.strategy_types = self._classify_signal(signal)
-        signal.observation_ids = self.store.ensure_signal_observations(
-            signal_run_id=signal.signal_run_id,
-            mint=signal.mint, symbol=signal.symbol,
-            strategy_types=signal.strategy_types,
-            discovered_at=signal.discovered_at,
-            features=self._signal_features(signal),
-            decision="discovered",
-        )
+        if not allow_recheck:
+            self.store.record_signal(
+                mint=signal.mint, symbol=signal.symbol, name=signal.name,
+                score=signal.overall_score, dev_buy_sol=signal.dev_buy_sol,
+                market_cap_sol=signal.market_cap_sol, liquidity_sol=signal.liquidity_sol,
+                buy_ratio=signal.buy_ratio, unique_wallets=signal.unique_wallets,
+                decision="discovered", reason="initial scanner signal",
+            )
+            signal.strategy_types = self._classify_signal(signal)
+            signal.observation_ids = self.store.ensure_signal_observations(
+                signal_run_id=signal.signal_run_id,
+                mint=signal.mint, symbol=signal.symbol,
+                strategy_types=signal.strategy_types,
+                discovered_at=signal.discovered_at,
+                features=self._signal_features(signal),
+                decision="discovered",
+            )
 
         # Enrich near-threshold Gecko pools before the score gate. This is
         # deliberately rate-limited so GMGN credits are not spent on every
@@ -489,7 +498,8 @@ class MemeHunterBot:
                 rejection_reason="score_below_40",
                 features=self._signal_features(signal),
             )
-            logger.info(f"   ⏭️ Score too low, skipping")
+            self.pending_signals[signal.mint] = signal
+            logger.info(f"   ⏭️ Score too low, queued for recheck")
             return
 
         # Perform risk analysis
@@ -567,19 +577,24 @@ class MemeHunterBot:
         should_trade = False
 
         if risk_report.is_tradeable(min_score=50):
-            if signal.overall_score >= 60:
+            launch_data_ok = (
+                signal.source != "gecko_new_pool"
+                or bool(signal.behavior_data.get("gmgn_enriched"))
+            )
+            if launch_data_ok and signal.overall_score >= 60:
                 should_trade = True
-            elif signal.is_whale_alert and whale_summary["total_sol"] >= 2:
+            elif launch_data_ok and signal.is_whale_alert and whale_summary["total_sol"] >= 2:
                 should_trade = True
 
         decision = "approved" if should_trade else "rejected"
+        rejection_reason = None if should_trade else self._rejection_reason(signal, risk_report, whale_summary)
         self.store.update_signal_observations(
             signal.signal_run_id,
             strategy_types=signal.strategy_types,
             decision=decision,
             approved=should_trade,
             risk_score=risk_report.overall_score,
-            rejection_reason=None if should_trade else self._rejection_reason(signal, risk_report, whale_summary),
+            rejection_reason=rejection_reason,
             features=self._signal_features(signal, whale_summary, risk_report),
         )
         self.store.record_signal(
@@ -619,8 +634,14 @@ class MemeHunterBot:
             if signal.overall_score >= 70 or (signal.is_whale_alert and whale_summary["total_sol"] > 2):
                 logger.info(f"   🚀 STRONG SIGNAL - Opening position...")
                 await self._open_position(signal)
+            self.pending_signals.pop(signal.mint, None)
         else:
-            logger.info(f"   ❌ REJECTED - Risk too high or insufficient conviction")
+            if rejection_reason and (
+                rejection_reason.startswith("risk_data_unavailable")
+                or rejection_reason in {"launch_quality_data_unavailable", "opportunity_score_below_60"}
+            ):
+                self.pending_signals[signal.mint] = signal
+            logger.info(f"   ❌ REJECTED - {rejection_reason or 'unknown reason'}")
 
     async def _open_position(self, signal: TokenSignal):
         """Open a trading position"""
@@ -666,6 +687,21 @@ class MemeHunterBot:
             except Exception as exc:
                 logger.warning("Balance monitor error: %s", exc)
                 await asyncio.sleep(30)
+
+    async def _run_signal_recheck(self):
+        """Revisit signals while launch/risk APIs catch up with new tokens."""
+        while self.running:
+            await asyncio.sleep(config.TRADING.signal_recheck_interval_seconds)
+            now = datetime.now()
+            for mint, signal in list(self.pending_signals.items()):
+                age = (now - signal.discovered_at).total_seconds()
+                if age > config.TRADING.signal_recheck_max_age_seconds:
+                    self.pending_signals.pop(mint, None)
+                    continue
+                try:
+                    await self._handle_token_signal(signal, allow_recheck=True)
+                except Exception as exc:
+                    logger.warning("Signal recheck failed for %s: %s", mint[:12], exc)
 
     async def _run_price_monitor(self):
         """Monitor token prices"""

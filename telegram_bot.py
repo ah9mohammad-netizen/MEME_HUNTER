@@ -201,6 +201,12 @@ class TelegramBot:
 
         summary = self.trading_engine.get_portfolio_summary()
 
+        cash = summary.get("cash_ledger", {})
+        reconciliation = cash.get("reconciliation_delta_sol")
+        reconciliation_line = (
+            f"🧮 Cash reconciliation: `{reconciliation:+.4f} SOL`\n"
+            if reconciliation is not None else ""
+        )
         status = f"""
 *📊 PORTFOLIO STATUS*
 
@@ -213,7 +219,7 @@ Mode: `{type(self.trading_engine.client).__name__}`
 📈 Unrealized PnL: `{summary['unrealized_pnl_sol']:+.4f} SOL`
 ✅ Realized PnL: `{summary['realized_pnl_sol']:+.4f} SOL`
 🎯 Total PnL: `{summary['total_pnl_sol']:+.4f} SOL`
-"""
+{reconciliation_line}"""
         await self.send_message(status)
 
     async def cmd_positions(self, args):
@@ -372,7 +378,9 @@ Mode: `{type(self.trading_engine.client).__name__}`
             lines.append(
                 f"{emoji} `{row['symbol']}` {row['side'].upper()} "
                 f"{row['sol_amount']:.4f} SOL · {row['strategy']}\n"
-                f"   {row['reason']} · {row['created_at']}"
+                f"   {row['reason']} · net PnL `{row.get('realized_pnl_sol', 0):+.4f}` "
+                f"fee `{row.get('fee_sol', 0):.4f}` slip `{row.get('slippage_sol', 0):.4f}`\n"
+                f"   {row['created_at']}"
             )
         await self.send_message("\n".join(lines))
 

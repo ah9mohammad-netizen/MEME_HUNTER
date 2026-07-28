@@ -187,6 +187,19 @@ class DCAExecutor:
         position.dca_complete = position.dca_pending_sol <= 0
         return filled_sol
 
+    def cancel_pending(self, position: Position, reason: str) -> int:
+        """Cancel unfilled DCA legs once the position is in an exit state."""
+        cancelled = 0
+        for order in position.dca_orders:
+            if order.status == "pending":
+                order.status = "skipped"
+                cancelled += 1
+        position.dca_pending_sol = 0.0
+        position.dca_complete = True
+        if cancelled:
+            logger.info("Cancelled %s pending DCA leg(s) for %s: %s", cancelled, position.token_symbol, reason)
+        return cancelled
+
     async def add_dca_leg(self, position: Position, additional_sol: float) -> DCAOrder:
         """Add a manual/emergency DCA leg, subject to the caller's balance guard."""
         next_leg = len(position.dca_orders) + 1
@@ -439,19 +452,18 @@ class TradingEngine:
             position.min_price = min(position.min_price or position.entry_price, current_price)
             drawdown_pct = (current_price / position.peak_price - 1) * 100 if position.peak_price > 0 else 0.0
             position.max_drawdown_pct = min(position.max_drawdown_pct, drawdown_pct)
-            pending_spend = await self.dca_executor.execute_pending(position, current_price)
-            if pending_spend > 0:
-                self.capital_manager.update_after_execution(pending_spend)
-            grid_fills = await self.grid_seller.monitor_and_sell(position, current_price)
-            for fill in grid_fills:
-                self.capital_manager.update_after_receipt(fill.get("proceeds", 0))
+
+            # Exit protection is evaluated before a pending DCA leg. A falling
+            # price must not trigger a buy and then immediately stop it out.
             position.unrealized_pnl_sol = current_price * position.total_tokens - position.remaining_cost_sol
             position.unrealized_pnl_pct = (
                 (current_price / position.entry_price - 1) * 100 if position.entry_price else 0
             )
             if position.stop_loss_price and current_price <= position.stop_loss_price:
+                self.dca_executor.cancel_pending(position, "stop loss before DCA")
                 await self._emergency_exit(position, "Stop loss triggered")
                 continue
+
             activation_pct = config.TRADING.trailing_stop_activation_pct
             distance_pct = config.TRADING.trailing_stop_distance_pct
             if position.peak_price >= position.entry_price * (1 + activation_pct / 100):
@@ -461,8 +473,30 @@ class TradingEngine:
                     position.peak_price * (1 - distance_pct / 100),
                 )
             if position.trailing_stop_active and current_price <= position.trailing_stop_price:
+                self.dca_executor.cancel_pending(position, "trailing stop before DCA")
                 await self._emergency_exit(position, "Trailing stop triggered")
                 continue
+
+            # Once any grid profit is taken, do not average back into the same
+            # position. This prevents a late DCA buy after a profitable exit.
+            if position.grid_sold_pct > 0:
+                self.dca_executor.cancel_pending(position, "grid selling started")
+            else:
+                pending_spend = await self.dca_executor.execute_pending(position, current_price)
+                if pending_spend > 0:
+                    self.capital_manager.update_after_execution(pending_spend)
+                    position.unrealized_pnl_sol = current_price * position.total_tokens - position.remaining_cost_sol
+                    position.unrealized_pnl_pct = (
+                        (current_price / position.entry_price - 1) * 100 if position.entry_price else 0
+                    )
+
+            grid_fills = await self.grid_seller.monitor_and_sell(position, current_price)
+            for fill in grid_fills:
+                self.capital_manager.update_after_receipt(fill.get("proceeds", 0))
+            position.unrealized_pnl_sol = current_price * position.total_tokens - position.remaining_cost_sol
+            position.unrealized_pnl_pct = (
+                (current_price / position.entry_price - 1) * 100 if position.entry_price else 0
+            )
             if position.signal_run_id:
                 self.store.update_signal_market(
                     position.signal_run_id, current_price, position.max_price,
@@ -498,6 +532,7 @@ class TradingEngine:
         return True
 
     async def _finalize(self, position: Position, reason: str) -> None:
+        self.dca_executor.cancel_pending(position, "position finalized")
         position.status = TokenStatus.CLOSED
         position.moon_bag_tokens = 0
         position.unrealized_pnl_sol = 0.0
@@ -537,6 +572,15 @@ class TradingEngine:
         # realized PnL must come from the durable sell ledger.
         stats = self.store.get_trade_stats()
         realized = stats["realized_pnl_sol"]
+        cash_ledger = self.store.get_cash_ledger(
+            float(getattr(self.client, "starting_balance_sol", self.capital_manager.reference_balance_sol) or 0)
+        )
+        paper_cash = getattr(self.client, "balance_sol", None)
+        if paper_cash is not None:
+            cash_ledger["paper_cash_balance_sol"] = float(paper_cash)
+            cash_ledger["reconciliation_delta_sol"] = (
+                float(paper_cash) - cash_ledger["ledger_cash_balance_sol"]
+            )
         snapshot = {
             **capital, "unrealized_pnl_sol": unrealized,
             "realized_pnl_sol": realized, "total_pnl_sol": realized + unrealized,
@@ -544,6 +588,7 @@ class TradingEngine:
         self.store.save_snapshot(snapshot)
         return {
             **snapshot,
+            "cash_ledger": cash_ledger,
             "active_positions": len(positions),
             "total_invested_sol": sum(item.total_invested_sol for item in positions),
             "total_trades": stats["sell_fills"], "win_rate": stats["win_rate"],

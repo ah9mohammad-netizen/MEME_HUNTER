@@ -23,6 +23,7 @@ logger = logging.getLogger(__name__)
 class ScanFilters:
     """Filters for token discovery"""
     min_dev_buy_sol: float = 0.3
+    min_market_cap_sol: float = 0.0
     max_market_cap_sol: float = 100.0
     min_liquidity_sol: float = 1.0
     min_unique_wallets: int = 5
@@ -296,11 +297,14 @@ class PumpPortalScanner(TokenSource):
             "bundle_risk_score": round(min(100.0, bundle_risk_score), 2),
             "creator_sold": creator_sold,
             "data_quality": "observed" if data.get("traders") else "limited",
+            "dev_buy_known": True,
         }
 
     def _passes_filters(self, data: Dict, buy_ratio: float) -> bool:
         """Check if token passes configured filters"""
         if data["dev_buy_sol"] < self.filters.min_dev_buy_sol:
+            return False
+        if data["market_cap_sol"] < self.filters.min_market_cap_sol:
             return False
         if data["market_cap_sol"] > self.filters.max_market_cap_sol:
             return False
@@ -406,6 +410,7 @@ class DexScreenerScanner(TokenSource):
                 total_trades=total_trades,
                 behavior_data={
                     "data_quality": "pool_snapshot",
+                    "dev_buy_known": False,
                     "migration": dex_id in {"raydium", "pumpswap", "raydium-clmm"},
                     "dex": dex_id,
                 },
@@ -463,6 +468,8 @@ class DexScreenerScanner(TokenSource):
     def _passes_filters(self, signal: TokenSignal) -> bool:
         """Check if signal passes filters"""
         if signal.liquidity_sol < self.filters.min_liquidity_sol:
+            return False
+        if signal.market_cap_sol < self.filters.min_market_cap_sol:
             return False
         if signal.market_cap_sol > self.filters.max_market_cap_sol:
             return False

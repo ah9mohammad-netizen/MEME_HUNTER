@@ -60,9 +60,12 @@ class TradingConfig:
     # Smart-money confirmation must be convergent by default.
     min_confirming_whales: int = 2
     gmgn_token_enrich_per_hour: int = 50
+    signal_recheck_interval_seconds: int = 60
+    signal_recheck_max_age_seconds: int = 1800
 
     # Indicators & filters
     min_liquidity_usd: float = 5000.0
+    min_market_cap_usd: float = 5000.0
     min_buy_ratio: float = 0.6
     min_unique_wallets: int = 10
     max_top_holder_pct: float = 30.0

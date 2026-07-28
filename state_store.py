@@ -442,6 +442,29 @@ class StateStore:
             ).fetchall()
         return [dict(row) for row in rows]
 
+    def get_cash_ledger(self, starting_balance_sol: float) -> Dict[str, float]:
+        """Reconcile simulated cash against the immutable fill ledger."""
+        with self._lock:
+            row = self._connection.execute(
+                """SELECT COALESCE(SUM(CASE WHEN side='buy' THEN sol_amount ELSE 0 END),0) AS buys,
+                   COALESCE(SUM(CASE WHEN side='sell' THEN sol_amount ELSE 0 END),0) AS sells,
+                   COALESCE(SUM(fee_sol),0) AS fees,
+                   COALESCE(SUM(slippage_sol),0) AS slippage
+                   FROM trade_events"""
+            ).fetchone()
+        buys = float(row["buys"] or 0)
+        sells = float(row["sells"] or 0)
+        fees = float(row["fees"] or 0)
+        slippage = float(row["slippage"] or 0)
+        return {
+            "starting_balance_sol": float(starting_balance_sol),
+            "buy_cash_sol": buys,
+            "sell_cash_sol": sells,
+            "fees_sol": fees,
+            "slippage_sol": slippage,
+            "ledger_cash_balance_sol": float(starting_balance_sol) - buys + sells,
+        }
+
     def get_trade_stats(self) -> Dict[str, float]:
         with self._lock:
             row = self._connection.execute(
