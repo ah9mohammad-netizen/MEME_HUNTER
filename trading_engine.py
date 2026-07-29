@@ -419,6 +419,11 @@ class TradingEngine:
         position = self.active_positions.get(mint)
         if not position:
             return None
+        # Never add risk after a profit-taking grid has begun.  Pending DCA
+        # legs are cancelled by the monitor as well, but this guard also covers
+        # a Telegram/manual DCA request between monitor ticks.
+        if position.grid_sold_pct > 0 or position.status not in (TokenStatus.HOLDING, TokenStatus.DCA_ENTRING):
+            return None
         remaining_cap = max(
             0.0,
             self.capital_manager.position_cap_sol()
@@ -516,6 +521,8 @@ class TradingEngine:
             return False
         amount = float(result_value(result, "tokens_sold", position.total_tokens) or position.total_tokens)
         position.last_price = float(result_value(result, "price", position.last_price or position.entry_price) or position.last_price or position.entry_price)
+        position.max_price = max(position.max_price or position.entry_price, position.last_price)
+        position.min_price = min(position.min_price or position.entry_price, position.last_price)
         proceeds = float(result_value(result, "sol_received", 0) or 0)
         pnl = GridSeller._apply_sale(position, amount, proceeds)
         position.total_fees_sol += float(result_value(result, "gas_used", 0) or 0)

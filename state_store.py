@@ -337,32 +337,83 @@ class StateStore:
             )
 
     def get_rejection_report(self) -> Dict[str, Any]:
-        """Summarize why signals did not reach a paper entry."""
+        """Summarize why each unique signal run did not reach paper entry.
+
+        A signal can carry several strategy labels, so counting observation
+        rows directly makes the reason totals overlap.  It is also possible
+        for a recheck to move a run from ``score_filtered`` to ``rejected`` or
+        ``approved``.  Collapse the observations to one final category per
+        signal run before producing the report.
+        """
         with self._lock:
-            totals = self._connection.execute(
-                """SELECT COUNT(DISTINCT signal_run_id) AS total,
-                   COUNT(DISTINCT CASE WHEN approved=1 THEN signal_run_id END) AS approved,
-                   COUNT(DISTINCT CASE WHEN decision='score_filtered' THEN signal_run_id END) AS score_filtered,
-                   COUNT(DISTINCT CASE WHEN decision='rejected' THEN signal_run_id END) AS rejected,
-                   COUNT(DISTINCT CASE WHEN decision='paused' THEN signal_run_id END) AS paused
-                   FROM signal_observations"""
-            ).fetchone()
-            rows = self._connection.execute(
-                """SELECT COALESCE(rejection_reason, decision) AS reason,
-                   COUNT(DISTINCT signal_run_id) AS signals
-                   FROM signal_observations
-                   WHERE approved=0 AND decision IN ('score_filtered','rejected','paused')
-                   GROUP BY COALESCE(rejection_reason, decision)
+            runs = self._connection.execute(
+                """WITH grouped AS (
+                       SELECT signal_run_id,
+                              MAX(approved) AS approved,
+                              MAX(CASE WHEN decision='rejected' THEN 1 ELSE 0 END) AS rejected,
+                              MAX(CASE WHEN decision='score_filtered' THEN 1 ELSE 0 END) AS score_filtered,
+                              MAX(CASE WHEN decision='paused' THEN 1 ELSE 0 END) AS paused,
+                              MAX(CASE WHEN decision='rejected' THEN rejection_reason END) AS rejected_reason,
+                              MAX(CASE WHEN decision='score_filtered' THEN rejection_reason END) AS score_reason,
+                              MAX(CASE WHEN decision='paused' THEN rejection_reason END) AS paused_reason
+                       FROM signal_observations
+                       GROUP BY signal_run_id
+                   ), classified AS (
+                       SELECT signal_run_id,
+                              CASE
+                                WHEN approved=1 THEN 'approved'
+                                WHEN rejected=1 THEN 'rejected'
+                                WHEN score_filtered=1 THEN 'score_filtered'
+                                WHEN paused=1 THEN 'paused'
+                                ELSE 'pending'
+                              END AS category,
+                              CASE
+                                WHEN approved=1 THEN 'approved'
+                                WHEN rejected=1 THEN COALESCE(rejected_reason, 'rejected')
+                                WHEN score_filtered=1 THEN COALESCE(score_reason, 'score_filtered')
+                                WHEN paused=1 THEN COALESCE(paused_reason, 'paused')
+                                ELSE 'pending'
+                              END AS reason
+                       FROM grouped
+                   )
+                   SELECT category, reason, COUNT(*) AS signals
+                   FROM classified
+                   GROUP BY category, reason
                    ORDER BY signals DESC"""
             ).fetchall()
-        return {
-            "total_signals": int(totals["total"] or 0),
-            "approved": int(totals["approved"] or 0),
-            "score_filtered": int(totals["score_filtered"] or 0),
-            "risk_rejected": int(totals["rejected"] or 0),
-            "paused": int(totals["paused"] or 0),
-            "reasons": [dict(row) for row in rows],
+
+        totals = {
+            "total_signals": 0,
+            "approved": 0,
+            "score_filtered": 0,
+            "risk_rejected": 0,
+            "paused": 0,
+            "pending": 0,
         }
+        reasons: Dict[str, int] = {}
+        for row in runs:
+            category = row["category"]
+            count = int(row["signals"] or 0)
+            totals["total_signals"] += count
+            if category == "approved":
+                totals["approved"] += count
+            elif category == "score_filtered":
+                totals["score_filtered"] += count
+            elif category == "rejected":
+                totals["risk_rejected"] += count
+            elif category == "paused":
+                totals["paused"] += count
+            else:
+                totals["pending"] += count
+
+            if category not in {"approved", "pending"}:
+                reason = str(row["reason"] or category)
+                reasons[reason] = reasons.get(reason, 0) + count
+
+        return {**totals, "reasons": [
+            {"reason": reason, "signals": count}
+            for reason, count in sorted(reasons.items(), key=lambda item: (-item[1], item[0]))
+        ]}
 
     def get_strategy_performance(self) -> List[Dict[str, Any]]:
         """Return comparable performance metrics for each strategy type."""
@@ -371,6 +422,10 @@ class StateStore:
                 """SELECT strategy_type, COUNT(*) AS signals,
                    COALESCE(SUM(approved),0) AS approvals,
                    COALESCE(SUM(entered),0) AS entries,
+                   COUNT(CASE WHEN entered=1 AND closed_at IS NOT NULL THEN 1 END) AS closed_entries,
+                   COUNT(CASE WHEN entered=1 AND closed_at IS NULL THEN 1 END) AS open_entries,
+                   COALESCE(SUM(CASE WHEN entered=1 AND closed_at IS NOT NULL
+                                     AND false_positive=0 THEN 1 ELSE 0 END),0) AS winning_entries,
                    COALESCE(SUM(realized_pnl_sol),0) AS realized_pnl_sol,
                    COALESCE(AVG(max_multiple),0) AS avg_entry_to_max_multiple,
                    COALESCE(AVG(max_drawdown_pct),0) AS avg_max_drawdown_pct,
@@ -385,11 +440,22 @@ class StateStore:
         for row in rows:
             item = dict(row)
             entries = int(item["entries"] or 0)
+            closed_entries = int(item["closed_entries"] or 0)
             signals = int(item["signals"] or 0)
             item["approval_rate_pct"] = (item["approvals"] / signals * 100) if signals else 0.0
             item["entry_rate_pct"] = (entries / signals * 100) if signals else 0.0
-            item["realized_expectancy_sol"] = (item["realized_pnl_sol"] / entries) if entries else 0.0
-            item["false_positive_rate_pct"] = (item["false_positives"] / entries * 100) if entries else 0.0
+            # Expectancy and false-positive rate are closed-trade metrics;
+            # open entries must not look like zero-profit trades.
+            item["realized_expectancy_sol"] = (
+                item["realized_pnl_sol"] / closed_entries if closed_entries else 0.0
+            )
+            item["false_positive_rate_pct"] = (
+                item["false_positives"] / closed_entries * 100 if closed_entries else 0.0
+            )
+            item["win_rate_pct"] = (
+                int(item["winning_entries"] or 0) / closed_entries * 100
+                if closed_entries else 0.0
+            )
             result.append(item)
         return result
 
@@ -435,12 +501,90 @@ class StateStore:
             )
             return int(cursor.lastrowid)
 
+    def _replay_cost_basis(self) -> Dict[str, Any]:
+        """Replay fills with weighted-average cost basis.
+
+        ``Position.entry_price`` is an average of all buys.  It is not a safe
+        sale cost after a partial grid exit followed by another buy, because
+        the remaining inventory can have a different cost.  Replaying the
+        immutable fill ledger gives reports a stable, corrected result even
+        for fills written by older versions of the bot.
+        """
+        with self._lock:
+            rows = self._connection.execute(
+                """SELECT id,position_mint,side,sol_amount,token_amount,
+                          realized_pnl_sol
+                   FROM trade_events ORDER BY id ASC"""
+            ).fetchall()
+
+        inventory: Dict[str, Dict[str, float]] = {}
+        corrected: Dict[int, float] = {}
+        realized = 0.0
+        raw_realized = 0.0
+        wins = 0
+        sells = 0
+        buys = 0.0
+        sell_cash = 0.0
+
+        for row in rows:
+            event_id = int(row["id"])
+            mint = str(row["position_mint"])
+            side = str(row["side"]).lower()
+            sol_amount = max(0.0, float(row["sol_amount"] or 0.0))
+            token_amount = max(0.0, float(row["token_amount"] or 0.0))
+            if side == "buy":
+                item = inventory.setdefault(mint, {"tokens": 0.0, "cost": 0.0})
+                item["tokens"] += token_amount
+                item["cost"] += sol_amount
+                buys += sol_amount
+                continue
+            if side != "sell":
+                continue
+
+            sells += 1
+            sell_cash += sol_amount
+            raw_realized += float(row["realized_pnl_sol"] or 0.0)
+            item = inventory.setdefault(mint, {"tokens": 0.0, "cost": 0.0})
+            sold = min(token_amount, item["tokens"])
+            cost = (
+                item["cost"] * sold / item["tokens"]
+                if item["tokens"] > 0 and sold > 0 else 0.0
+            )
+            pnl = sol_amount - cost
+            corrected[event_id] = pnl
+            realized += pnl
+            if pnl > 0:
+                wins += 1
+            item["tokens"] = max(0.0, item["tokens"] - sold)
+            item["cost"] = max(0.0, item["cost"] - cost)
+
+        open_cost = sum(item["cost"] for item in inventory.values())
+        open_tokens = sum(item["tokens"] for item in inventory.values())
+        return {
+            "corrected_realized_pnl_sol": realized,
+            "raw_realized_pnl_sol": raw_realized,
+            "corrected_by_event": corrected,
+            "sell_fills": sells,
+            "winning_fills": wins,
+            "buy_cash_sol": buys,
+            "sell_cash_sol": sell_cash,
+            "open_cost_sol": open_cost,
+            "open_tokens": open_tokens,
+        }
+
     def get_trade_history(self, limit: int = 100) -> List[Dict[str, Any]]:
         with self._lock:
             rows = self._connection.execute(
                 "SELECT * FROM trade_events ORDER BY id DESC LIMIT ?", (int(limit),)
             ).fetchall()
-        return [dict(row) for row in rows]
+        history = [dict(row) for row in rows]
+        corrected = self._replay_cost_basis()["corrected_by_event"]
+        for item in history:
+            if item["side"] == "sell" and int(item["id"]) in corrected:
+                # Expose corrected net P&L for legacy events without mutating
+                # the immutable audit ledger.
+                item["realized_pnl_sol"] = corrected[int(item["id"])]
+        return history
 
     def get_cash_ledger(self, starting_balance_sol: float) -> Dict[str, float]:
         """Reconcile simulated cash against the immutable fill ledger."""
@@ -466,20 +610,19 @@ class StateStore:
         }
 
     def get_trade_stats(self) -> Dict[str, float]:
-        with self._lock:
-            row = self._connection.execute(
-                """SELECT COUNT(*) AS fills,
-                   COALESCE(SUM(realized_pnl_sol),0) AS realized_pnl,
-                   COALESCE(SUM(CASE WHEN realized_pnl_sol > 0 THEN 1 ELSE 0 END),0) AS wins
-                   FROM trade_events WHERE side='sell'"""
-            ).fetchone()
-        fills = int(row["fills"] or 0)
-        wins = int(row["wins"] or 0)
+        """Return cost-basis-corrected aggregate fill statistics."""
+        replay = self._replay_cost_basis()
+        fills = int(replay["sell_fills"])
+        wins = int(replay["winning_fills"])
         return {
             "sell_fills": fills,
-            "realized_pnl_sol": float(row["realized_pnl"] or 0),
+            "realized_pnl_sol": float(replay["corrected_realized_pnl_sol"]),
+            "raw_realized_pnl_sol": float(replay["raw_realized_pnl_sol"]),
             "winning_fills": wins,
             "win_rate": (wins / fills * 100.0) if fills else 0.0,
+            "open_cost_sol": float(replay["open_cost_sol"]),
+            "open_tokens": float(replay["open_tokens"]),
+            "cash_pnl_sol": float(replay["sell_cash_sol"] - replay["buy_cash_sol"]),
         }
 
     def save_snapshot(self, snapshot: Dict[str, float]) -> None:

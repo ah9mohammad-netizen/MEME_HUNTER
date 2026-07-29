@@ -409,8 +409,17 @@ Mode: `{type(self.trading_engine.client).__name__}`
             lines.append("No rejection reasons recorded yet.")
         await self.send_message("\n".join(lines))
 
+    @staticmethod
+    def _format_duration(seconds: float) -> str:
+        seconds = max(0.0, float(seconds or 0))
+        if seconds < 60:
+            return f"{seconds:.0f}s"
+        if seconds < 3600:
+            return f"{seconds / 60:.1f}m"
+        return f"{seconds / 3600:.1f}h"
+
     async def cmd_performance(self, args):
-        """Compare signal strategy types from the persisted observations."""
+        """Compare strategy types without treating open trades as losses."""
         if not self.trading_engine:
             await self.send_message("Trading engine not initialized")
             return
@@ -418,15 +427,17 @@ Mode: `{type(self.trading_engine.client).__name__}`
         if not rows:
             await self.send_message("📭 No strategy observations recorded yet.")
             return
-        lines = ["*📈 STRATEGY PERFORMANCE*"]
+        lines = ["*📈 STRATEGY PERFORMANCE*", "Expectancy/false positives use closed entries only."]
         for row in rows:
             lines.append(
                 f"*{row['strategy_type']}*\n"
-                f"Signals: {row['signals']} · Approval: {row['approval_rate_pct']:.1f}% · Entries: {row['entries']}\n"
+                f"Signals: {row['signals']} · Approval: {row['approval_rate_pct']:.1f}%\n"
+                f"Entries: {row['entries']} · Closed: {row['closed_entries']} · Open: {row['open_entries']}\n"
                 f"Expectancy: `{row['realized_expectancy_sol']:+.4f} SOL` · "
-                f"Max: `{row['avg_entry_to_max_multiple']:.2f}x`\n"
-                f"Drawdown: `{row['avg_max_drawdown_pct']:.1f}%` · "
-                f"Hold: `{row['avg_hold_seconds'] / 3600:.1f}h`\n"
+                f"Win rate: `{row['win_rate_pct']:.1f}%`\n"
+                f"Max: `{row['avg_entry_to_max_multiple']:.2f}x` · "
+                f"Drawdown: `{row['avg_max_drawdown_pct']:.1f}%`\n"
+                f"Hold: `{self._format_duration(row['avg_hold_seconds'])}`\n"
                 f"Fees: `{row['fees_sol']:.4f}` · Slippage: `{row['slippage_sol']:.4f}` · "
                 f"False positives: `{row['false_positive_rate_pct']:.1f}%`"
             )
