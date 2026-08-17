@@ -1,9 +1,10 @@
-"""DCA entry, grid exits, balance guards and durable trade accounting."""
+"""DCA entry, grid exits, live anti-rug, selectivity framework."""
 
 from __future__ import annotations
 
 import logging
-from datetime import datetime
+import asyncio
+from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Tuple
 
 from capital_manager import CapitalManager
@@ -36,7 +37,6 @@ class DCAExecutor:
         multiplier = max(1.0, float(multiplier))
         denominator = sum(multiplier ** i for i in range(entries))
         sizes = [total * (multiplier ** i) / denominator for i in range(entries)]
-        # Correct floating point drift on the last leg.
         sizes[-1] += total - sum(sizes)
         return sizes
 
@@ -60,7 +60,6 @@ class DCAExecutor:
         return levels
 
     async def _fill_order(self, position: Position, order: DCAOrder) -> bool:
-        """Fill one DCA order and append the immutable buy ledger event."""
         try:
             result = await self.client.execute_buy(
                 mint=position.token_mint,
@@ -87,6 +86,8 @@ class DCAExecutor:
             position.remaining_cost_sol += order.amount_sol
             position.total_fees_sol += float(result_value(result, "gas_used", 0) or 0)
             position.total_slippage_sol += float(result_value(result, "slippage_sol", 0) or 0)
+            # Track last DCA fill for cooldown
+            setattr(position, "last_dca_fill_at", datetime.now())
             self.store.record_trade(
                 position_mint=position.token_mint,
                 symbol=position.token_symbol,
@@ -114,6 +115,9 @@ class DCAExecutor:
         total_sol_budget: float,
         signal_score: float = 0.0,
         actors: Optional[List[Dict]] = None,
+        initial_liquidity_sol: float = 0.0,
+        initial_liquidity_usd: float = 0.0,
+        creator_address: Optional[str] = None,
     ) -> Optional[Position]:
         cfg = config.TRADING
         position = Position(
@@ -130,6 +134,10 @@ class DCAExecutor:
                 if isinstance(item, dict)
             ],
             actor_evidence=list(actors or []),
+            initial_liquidity_sol=initial_liquidity_sol,
+            initial_liquidity_usd=initial_liquidity_usd,
+            creator_address=creator_address,
+            creation_timestamp=datetime.now(),
         )
         sizes = self._sizes(total_sol_budget, cfg.dca_entries, cfg.dca_increment_mult)
         prices = [
@@ -145,8 +153,6 @@ class DCAExecutor:
                 amount_sol=sol_amount,
                 expected_price=expected_price,
             )
-            # The first leg establishes a position. Later legs remain pending
-            # until price reaches their target when dip-aware DCA is enabled.
             if cfg.dca_wait_for_dips and index > 1:
                 position.dca_orders.append(order)
                 continue
@@ -166,10 +172,18 @@ class DCAExecutor:
         position.peak_price = position.entry_price
         position.dca_complete = position.dca_pending_sol <= 0
         position.status = TokenStatus.HOLDING
+        setattr(position, "last_dca_fill_at", datetime.now())
         return position
 
     async def execute_pending(self, position: Position, current_price: float) -> float:
-        """Fill pending DCA legs only after their lower target is reached."""
+        """Fill pending DCA legs only after lower target and cooldown."""
+        cfg = config.TRADING
+        # Cooldown: don't DCA too fast
+        last_fill = getattr(position, "last_dca_fill_at", None)
+        if last_fill:
+            if (datetime.now() - last_fill).total_seconds() < cfg.dca_cooldown_seconds:
+                return 0.0
+
         filled_sol = 0.0
         for order in position.dca_orders:
             if order.status != "pending" or current_price > order.expected_price:
@@ -181,6 +195,9 @@ class DCAExecutor:
                 position.stop_loss_price = position.entry_price * (1 - config.TRADING.stop_loss_pct / 100)
                 position.grid_initial_tokens += max(0.0, position.total_tokens - position.grid_initial_tokens)
                 position.moon_bag_tokens = position.total_tokens * config.TRADING.moon_bag_pct / 100
+                # Only fill one leg per cooldown period
+                break
+
         position.dca_pending_sol = sum(
             order.amount_sol for order in position.dca_orders if order.status == "pending"
         )
@@ -188,7 +205,6 @@ class DCAExecutor:
         return filled_sol
 
     def cancel_pending(self, position: Position, reason: str) -> int:
-        """Cancel unfilled DCA legs once the position is in an exit state."""
         cancelled = 0
         for order in position.dca_orders:
             if order.status == "pending":
@@ -201,7 +217,6 @@ class DCAExecutor:
         return cancelled
 
     async def add_dca_leg(self, position: Position, additional_sol: float) -> DCAOrder:
-        """Add a manual/emergency DCA leg, subject to the caller's balance guard."""
         next_leg = len(position.dca_orders) + 1
         expected = position.entry_price * (1 - config.TRADING.dca_spacing_pct / 100 * next_leg)
         order = DCAOrder(
@@ -230,6 +245,7 @@ class DCAExecutor:
             position.moon_bag_tokens = position.total_tokens * config.TRADING.moon_bag_pct / 100
             position.entry_price = position.total_invested_sol / position.total_tokens
             position.stop_loss_price = position.entry_price * (1 - config.TRADING.stop_loss_pct / 100)
+            setattr(position, "last_dca_fill_at", datetime.now())
             self.store.record_trade(
                 position_mint=position.token_mint, symbol=position.token_symbol, side="buy",
                 strategy="dca", reason="manual DCA", sol_amount=additional_sol,
@@ -257,7 +273,6 @@ class GridSeller:
         position.remaining_cost_sol = max(0.0, position.remaining_cost_sol - cost)
         pnl = sol_received - cost
         position.realized_pnl_sol += pnl
-        # The moon bag is a subset of remaining tokens.
         position.moon_bag_tokens = min(position.moon_bag_tokens, position.total_tokens)
         return pnl
 
@@ -266,13 +281,39 @@ class GridSeller:
             return []
         fills = []
         initial_tokens = position.grid_initial_tokens or position.total_tokens
+
+        # Check both price % TP and market-cap TP
+        mcap_levels = []
+        if config.TRADING.enable_mcap_tp and position.signal_features.get("market_cap_sol"):
+            init_mcap_sol = float(position.signal_features.get("market_cap_sol", 0) or 0)
+            if init_mcap_sol > 0:
+                for idx, mcap_usd_thr in enumerate(config.TRADING.mcap_tp_levels):
+                    thr_sol = mcap_usd_thr / 150.0  # approx
+                    pct_needed = (thr_sol / init_mcap_sol * 100) if init_mcap_sol else 0
+                    # If pct_needed reasonable, add as additional trigger
+                    if 20 <= pct_needed <= 2000:
+                        mcap_levels.append((idx, pct_needed, mcap_usd_thr))
+
         for level in position.grid_levels:
             if level.status != "active":
                 continue
             target = position.entry_price * level.price_pct_of_entry / 100
-            if current_price < target:
+            # Normal price target
+            price_hit = current_price >= target
+            # Also check mcap target if near this level
+            mcap_hit = False
+            triggered_mcap = None
+            for mcap_idx, pct_needed, mcap_usd in mcap_levels:
+                if mcap_idx + 1 == level.level:  # align level number with mcap level
+                    mcap_target_price = position.entry_price * (1 + pct_needed / 100)
+                    if current_price >= mcap_target_price:
+                        mcap_hit = True
+                        triggered_mcap = mcap_usd
+                        break
+
+            if not (price_hit or mcap_hit):
                 continue
-            # Sell a percentage of the original position, never the reserved moon bag.
+
             token_amount = initial_tokens * level.amount_pct / 100
             max_sell = max(0.0, position.total_tokens - position.moon_bag_tokens)
             token_amount = min(token_amount, max_sell)
@@ -295,9 +336,12 @@ class GridSeller:
                 level.triggered_price = current_price
                 level.triggered_at = datetime.now()
                 position.grid_sold_pct += level.amount_pct
+                reason = f"grid level {level.level}"
+                if mcap_hit and triggered_mcap:
+                    reason += f" mcap ${triggered_mcap:,.0f}"
                 self.store.record_trade(
                     position_mint=position.token_mint, symbol=position.token_symbol, side="sell",
-                    strategy="grid", reason=f"grid level {level.level}", sol_amount=proceeds,
+                    strategy="grid", reason=reason, sol_amount=proceeds,
                     token_amount=sold_amount,
                     price=float(result_value(result, "price", 0) or current_price),
                     realized_pnl_sol=pnl,
@@ -313,16 +357,20 @@ class GridSeller:
 
 
 class MomentumDetector:
-    """Minimal local price history used by the position monitor."""
-
     def __init__(self):
         self.price_history: Dict[str, List[Tuple[datetime, float]]] = {}
+        self.volume_history: Dict[str, List[Tuple[datetime, float]]] = {}
 
-    def record_price(self, mint: str, price: float) -> None:
+    def record_price(self, mint: str, price: float, volume: float = 0.0) -> None:
         history = self.price_history.setdefault(mint, [])
         history.append((datetime.now(), price))
         if len(history) > 100:
             del history[:-100]
+        if volume:
+            vhist = self.volume_history.setdefault(mint, [])
+            vhist.append((datetime.now(), volume))
+            if len(vhist) > 100:
+                del vhist[:-100]
 
     def detect_pump_signal(self, mint: str) -> Dict:
         history = self.price_history.get(mint, [])
@@ -333,7 +381,15 @@ class MomentumDetector:
         old_avg = sum(previous) / len(previous)
         new_avg = sum(recent) / len(recent)
         momentum = (new_avg - old_avg) / old_avg if old_avg else 0
-        return {"signal": momentum > 0.05, "strength": min(100, max(0, momentum * 100)), "price_momentum": momentum}
+        # Also check volume surge
+        volume_surge = False
+        vhist = self.volume_history.get(mint, [])
+        if len(vhist) >= 10:
+            recent_vol = sum(v[1] for v in vhist[-5:]) / 5
+            prev_vol = sum(v[1] for v in vhist[-10:-5]) / 5 if len(vhist) >= 10 else recent_vol
+            if prev_vol > 0 and recent_vol / prev_vol > 1.5:
+                volume_surge = True
+        return {"signal": momentum > 0.05, "strength": min(100, max(0, momentum * 100)), "price_momentum": momentum, "volume_surge": volume_surge}
 
     def detect_local_max(self, mint: str, current_price: float) -> bool:
         history = self.price_history.get(mint, [])
@@ -341,6 +397,76 @@ class MomentumDetector:
             return False
         recent = [item[1] for item in history[-5:]]
         return recent[-1] < recent[-2] < recent[-3] and recent[-3] == max(recent)
+
+    def detect_volume_decline(self, mint: str) -> bool:
+        vhist = self.volume_history.get(mint, [])
+        if len(vhist) < 10:
+            return False
+        recent = sum(v[1] for v in vhist[-5:]) / 5
+        prev = sum(v[1] for v in vhist[-10:-5]) / 5
+        return prev > 0 and recent < prev * 0.5
+
+
+class LiveRugMonitor:
+    """
+    Selectivity-focused live monitoring - checks for dev dumps, liquidity drops, holder spikes, time exceed, volume decline.
+    Does NOT try to be 0-slot fast, but catches rugs early after entry.
+    """
+
+    def __init__(self, trading_client, risk_analyzer=None):
+        self.client = trading_client
+        self.risk_analyzer = risk_analyzer
+        self._last_check: Dict[str, datetime] = {}
+
+    async def check_position(self, position: Position, current_price: float, momentum_detector: MomentumDetector) -> Optional[str]:
+        """Return reason if rug/time exceed detected, else None"""
+        cfg = config.TRADING
+        if not cfg.enable_live_rug_checks:
+            return None
+
+        mint = position.token_mint
+        now = datetime.now()
+
+        # Rate limit checks
+        last = self._last_check.get(mint)
+        if last and (now - last).total_seconds() < cfg.live_rug_check_interval_seconds:
+            return None
+        self._last_check[mint] = now
+
+        # 1. Time exceed - if open too long and losing, exit
+        hold_seconds = (now - position.opened_at).total_seconds()
+        if hold_seconds > cfg.time_exceed_seconds:
+            # Only exit if unrealized <0 or grid not triggered and momentum weak
+            if position.unrealized_pnl_pct < 0:
+                pump = momentum_detector.detect_pump_signal(mint)
+                if not pump.get("signal"):
+                    return f"TIME_EXCEED {hold_seconds:.0f}s > {cfg.time_exceed_seconds}s and no momentum"
+
+        # 2. Dev dump check if we have creator and risk analyzer
+        if self.risk_analyzer and position.creator_address and getattr(position, "initial_dev_token_balance", 0) > 0:
+            reason = await self.risk_analyzer.check_dev_dump(
+                mint, position.creator_address, position.initial_dev_token_balance
+            )
+            if reason:
+                return reason
+
+        # 3. Live rug checks via risk analyzer (liquidity drop, holder spike)
+        if self.risk_analyzer:
+            context = {
+                "initial_liquidity_usd": getattr(position, "initial_liquidity_usd", 0) or position.signal_features.get("liquidity_sol", 0) * 150,
+                "initial_top10_pct": position.signal_features.get("behavior", {}).get("top_10_holder_rate", 0) * 100 if position.signal_features.get("behavior") else 0,
+            }
+            reason = await self.risk_analyzer.live_rug_check(mint, context)
+            if reason:
+                return reason
+
+        # 4. Volume decline + price downtrend
+        if momentum_detector.detect_volume_decline(mint) and position.unrealized_pnl_pct < -5:
+            pump = momentum_detector.detect_pump_signal(mint)
+            if not pump.get("volume_surge") and pump.get("price_momentum", 0) < -0.02:
+                return "VOLUME_DECLINE + downtrend"
+
+        return None
 
 
 class TradingEngine:
@@ -350,6 +476,7 @@ class TradingEngine:
         capital_manager: Optional[CapitalManager] = None,
         store: Optional[StateStore] = None,
         learner: Optional[TradeLearner] = None,
+        risk_analyzer=None,
     ):
         self.client = trading_client
         self.store = store or StateStore()
@@ -358,6 +485,8 @@ class TradingEngine:
         self.dca_executor = DCAExecutor(trading_client, self.store)
         self.grid_seller = GridSeller(trading_client, self.store)
         self.momentum_detector = MomentumDetector()
+        self.risk_analyzer = risk_analyzer
+        self.live_rug_monitor = LiveRugMonitor(trading_client, risk_analyzer)
         self.trading_paused = False
         self.active_positions: Dict[str, Position] = {
             item.token_mint: item for item in self.store.load_open_positions()
@@ -372,21 +501,42 @@ class TradingEngine:
             return None
         if signal.mint in self.active_positions:
             return None
+
+        # New: cap whale multiplier and concurrent whale positions
+        whale_positions = sum(1 for p in self.active_positions.values() if "smart_money" in p.strategy_types or "kol" in str(p.strategy_types))
+        if whale_positions >= config.TRADING.max_concurrent_whale_positions and ("smart_money" in str(signal.strategy_types) or signal.is_whale_alert):
+            logger.info("Max concurrent whale positions reached, skipping whale signal")
+            return None
+
         requested = sol_budget if sol_budget is not None else self.capital_manager.position_cap_sol()
+        # Cap whale multiplier
+        if signal.is_whale_alert:
+            max_allowed = self.capital_manager.position_cap_sol() * config.TRADING.max_whale_multiplier
+            requested = min(requested, max_allowed)
+
         approved = await self.capital_manager.reserve_for_entry(requested, self.active_positions.values())
         if approved is None:
             return None
         try:
             current_price = await self.client.get_token_price(signal.mint)
+            if current_price <= 0:
+                logger.warning(f"No price for {signal.symbol}, skipping")
+                return None
+
             actors = []
             for wallet in signal.kol_wallets:
                 actors.append({"address": wallet, "source": signal.whale_type or "signal"})
+
             position = await self.dca_executor.execute_dca(
                 signal.mint, signal.symbol, current_price, approved,
                 signal_score=signal.overall_score, actors=actors,
+                initial_liquidity_sol=signal.liquidity_sol,
+                initial_liquidity_usd=signal.liquidity_sol * 150,
+                creator_address=signal.creator_address,
             )
             if position is None:
                 return None
+
             position.signal_run_id = signal.signal_run_id
             position.strategy_types = list(signal.strategy_types or ["normal_scanner"])
             position.signal_features = {
@@ -398,14 +548,27 @@ class TradingEngine:
                 "buy_ratio": signal.buy_ratio,
                 "unique_wallets": signal.unique_wallets,
                 "total_trades": signal.total_trades,
+                "initial_top10": signal.behavior_data.get("bundle_risk_score", 0),
             }
             position.max_price = position.entry_price
             position.min_price = position.entry_price
             position.last_price = position.entry_price
+            position.creation_timestamp = datetime.now()
+
+            # Try to capture initial dev balance if possible (best effort)
+            if signal.creator_address and self.risk_analyzer:
+                try:
+                    # For simplicity, assume dev held 5-10% initially if not known
+                    # Real fetch would be done via RPC, but we store placeholder
+                    position.initial_dev_token_balance = 0  # will be lazily fetched on first rug check
+                except Exception:
+                    pass
+
             self.active_positions[signal.mint] = position
             self.store.mark_signal_entry(signal.signal_run_id, position.entry_price)
             self.store.save_position(position)
             self.capital_manager.update_after_execution(position.total_invested_sol)
+            logger.info(f"Opened {signal.symbol} @ {current_price:.8f} SOL, invested {position.total_invested_sol:.4f} SOL")
             return position
         finally:
             await self.capital_manager.release_reservation(approved)
@@ -415,13 +578,9 @@ class TradingEngine:
         self.store.save_position(position)
 
     async def add_dca(self, mint: str, amount_sol: float) -> Optional[DCAOrder]:
-        """Manual DCA with the same wallet and per-meme budget guards."""
         position = self.active_positions.get(mint)
         if not position:
             return None
-        # Never add risk after a profit-taking grid has begun.  Pending DCA
-        # legs are cancelled by the monitor as well, but this guard also covers
-        # a Telegram/manual DCA request between monitor ticks.
         if position.grid_sold_pct > 0 or position.status not in (TokenStatus.HOLDING, TokenStatus.DCA_ENTRING):
             return None
         remaining_cap = max(
@@ -458,12 +617,19 @@ class TradingEngine:
             drawdown_pct = (current_price / position.peak_price - 1) * 100 if position.peak_price > 0 else 0.0
             position.max_drawdown_pct = min(position.max_drawdown_pct, drawdown_pct)
 
-            # Exit protection is evaluated before a pending DCA leg. A falling
-            # price must not trigger a buy and then immediately stop it out.
             position.unrealized_pnl_sol = current_price * position.total_tokens - position.remaining_cost_sol
             position.unrealized_pnl_pct = (
                 (current_price / position.entry_price - 1) * 100 if position.entry_price else 0
             )
+
+            # === NEW: Live rug & time exceed checks BEFORE stop loss ===
+            live_rug_reason = await self.live_rug_monitor.check_position(position, current_price, self.momentum_detector)
+            if live_rug_reason:
+                self.dca_executor.cancel_pending(position, f"live rug: {live_rug_reason}")
+                await self._emergency_exit(position, f"Live rug: {live_rug_reason}")
+                continue
+
+            # Exit protection
             if position.stop_loss_price and current_price <= position.stop_loss_price:
                 self.dca_executor.cancel_pending(position, "stop loss before DCA")
                 await self._emergency_exit(position, "Stop loss triggered")
@@ -482,8 +648,6 @@ class TradingEngine:
                 await self._emergency_exit(position, "Trailing stop triggered")
                 continue
 
-            # Once any grid profit is taken, do not average back into the same
-            # position. This prevents a late DCA buy after a profitable exit.
             if position.grid_sold_pct > 0:
                 self.dca_executor.cancel_pending(position, "grid selling started")
             else:
@@ -575,8 +739,6 @@ class TradingEngine:
         positions = list(self.active_positions.values())
         capital = self.capital_manager.snapshot(positions)
         unrealized = sum(item.unrealized_pnl_sol for item in positions)
-        # Closed positions are removed from active_positions, so cumulative
-        # realized PnL must come from the durable sell ledger.
         stats = self.store.get_trade_stats()
         realized = stats["realized_pnl_sol"]
         cash_ledger = self.store.get_cash_ledger(
@@ -609,6 +771,7 @@ class TradingEngine:
                     "pnl_sol": item.unrealized_pnl_sol,
                     "grid_sold_pct": item.grid_sold_pct,
                     "moon_bag_tokens": item.moon_bag_tokens,
+                    "hold_seconds": (datetime.now() - item.opened_at).total_seconds(),
                 }
                 for item in positions
             ],

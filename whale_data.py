@@ -431,35 +431,107 @@ class WhaleDataFetcher:
 
     @staticmethod
     def get_smart_money_summary(token_mint: str, buys: List[Dict]) -> Dict:
+        """
+        Enhanced summary with vetting against inflated win rate and low trade count.
+        Applies config thresholds for min win rate and min trades if available in item.
+        """
         if not buys:
             return {
                 "signal": "NONE", "total_sol": 0.0, "total_buys": 0, "wallet_count": 0,
                 "whale_count": 0, "kol_count": 0, "avg_buy": 0.0, "avg_win_rate": 0.0, "top_buyer": None,
-                "conviction": "LOW", "all_buys": [],
+                "conviction": "LOW", "all_buys": [], "filtered_out": 0,
             }
-        total_sol = sum(float(item.get("sol_amount", 0) or 0) for item in buys)
-        whale_buys = [item for item in buys if item.get("source") == "gmgn" and item.get("sol_amount", 0) >= 2]
-        kol_buys = [item for item in buys if item.get("source") in ("kol", "kolscan")]
-        if total_sol >= 10:
+
+        # New: filter out wallets that look suspicious per selectivity framework
+        filtered_buys = []
+        filtered_out = 0
+        min_win = getattr(config.TRADING, "whale_min_win_rate", 55.0)
+        min_trades = getattr(config.TRADING, "whale_min_trades", 20)
+
+        for item in buys:
+            # Ignore tiny test buys <0.1 SOL if not already filtered
+            if float(item.get("sol_amount", 0) or 0) < 0.1:
+                filtered_out += 1
+                continue
+            # If win_rate known, require min win rate unless it's a KOL (KOL may have different metrics)
+            wr = item.get("win_rate")
+            if wr is not None:
+                try:
+                    wr_f = float(wr)
+                    # Win rate is 0-1 or 0-100? Normalize
+                    if wr_f <= 1:
+                        wr_f *= 100
+                    if wr_f < min_win and wr_f != 0:
+                        # Allow if source is gmgn and amount big? No, strict for selectivity
+                        # Except if convction high and it's a KOL we keep but log
+                        if item.get("source") != "kol":
+                            filtered_out += 1
+                            continue
+                except (TypeError, ValueError):
+                    pass
+            # If total trades known and < min, skip - likely inflated win rate via holding losers
+            total_trades = item.get("total_trades") or item.get("trade_count")
+            if total_trades is not None:
+                try:
+                    if int(total_trades) < min_trades:
+                        filtered_out += 1
+                        continue
+                except (TypeError, ValueError):
+                    pass
+            filtered_buys.append(item)
+
+        # Use filtered list for signal, but keep original for evidence
+        use_buys = filtered_buys if filtered_buys else buys
+        if not filtered_buys:
+            # If all filtered, downgrade signal to NONE to avoid false whale alert
+            pass
+
+        total_sol = sum(float(item.get("sol_amount", 0) or 0) for item in use_buys)
+        whale_buys = [item for item in use_buys if item.get("source") == "gmgn" and float(item.get("sol_amount", 0) or 0) >= 2]
+        kol_buys = [item for item in use_buys if item.get("source") in ("kol", "kolscan")]
+
+        # Conviction now also considers wallet diversity
+        wallet_count = len({item.get("address", item.get("wallet")) for item in use_buys})
+        if total_sol >= 10 and wallet_count >= 3:
             signal, conviction = "STRONG", "HIGH"
-        elif total_sol >= 5:
+        elif total_sol >= 5 and wallet_count >= 2:
             signal, conviction = "MODERATE", "MEDIUM"
         elif total_sol >= 2:
             signal, conviction = "WEAK", "LOW"
         else:
             signal, conviction = "MINIMAL", "VERY_LOW"
-        known_win_rates = [
-            float(item.get("win_rate", 0) or 0) for item in buys
-            if item.get("win_rate") is not None
-        ]
+
+        # If filtered out many, reduce conviction
+        if filtered_out >= 3 and conviction in {"HIGH", "MEDIUM"}:
+            conviction = "LOW"
+            signal = "WEAK"
+
+        known_win_rates = []
+        for item in use_buys:
+            wr = item.get("win_rate")
+            if wr is not None:
+                try:
+                    wr_f = float(wr)
+                    if wr_f <= 1:
+                        wr_f *= 100
+                    known_win_rates.append(wr_f)
+                except (TypeError, ValueError):
+                    pass
+
         return {
-            "signal": signal, "total_sol": total_sol, "total_buys": len(buys),
-            "wallet_count": len({item.get("address", item.get("wallet")) for item in buys}),
+            "signal": signal if filtered_buys else "NONE",
+            "total_sol": total_sol,
+            "total_buys": len(use_buys),
+            "wallet_count": wallet_count,
             "whale_count": len(whale_buys),
-            "kol_count": len(kol_buys), "avg_buy": total_sol / len(buys),
+            "kol_count": len(kol_buys),
+            "avg_buy": total_sol / len(use_buys) if use_buys else 0.0,
             "avg_win_rate": sum(known_win_rates) / len(known_win_rates) if known_win_rates else 0.0,
-            "top_buyer": max(buys, key=lambda item: item.get("sol_amount", 0)),
-            "conviction": conviction, "all_buys": buys,
+            "top_buyer": max(use_buys, key=lambda item: float(item.get("sol_amount", 0) or 0)) if use_buys else None,
+            "conviction": conviction,
+            "all_buys": use_buys,
+            "filtered_out": filtered_out,
+            "original_buys_count": len(buys),
         }
 
     def learn_from_profitable_token(
