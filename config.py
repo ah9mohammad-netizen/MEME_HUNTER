@@ -20,6 +20,9 @@ class TradingConfig:
     # Wallet settings
     wallet_private_key: str = ""
     rpc_endpoint: str = "https://api.mainnet-beta.solana.com"
+    helius_api_key: str = ""
+    helius_rpc_ws: str = ""  # wss://atlas-mainnet.helius-rpc.com/?api-key=...
+    logs_subscribe_enabled: bool = False
 
     # Capital allocation.  The percentage is applied to the latest observed
     # free SOL balance (or the startup balance before the first refresh).
@@ -37,20 +40,44 @@ class TradingConfig:
     dca_spacing_pct: float = 10.0
     dca_increment_mult: float = 1.5
     dca_wait_for_dips: bool = True
+    dca_cooldown_seconds: int = 15
 
-    # Grid selling settings
+    # Grid selling settings - V3: earlier profit taking for 1.4x max reality
     grid_levels: int = 5
-    grid_spacing_pct: float = 15.0
-    first_tp_pct: float = 50.0
-    moon_bag_pct: float = 20.0
+    grid_spacing_pct: float = 18.0  # was 15, now wider spread for earlier TPs
+    first_tp_pct: float = 25.0  # was 50 – too high for 1.41x max observed, now take 25% first
+    moon_bag_pct: float = 25.0  # was 20, keep more for runners after earlier takes
+    # Market-cap based TPs for migrated tokens (Raydium/PumpSwap)
+    enable_mcap_tp: bool = True
+    mcap_tp_levels: List[float] = None  # USD thresholds
 
-    # Risk management
-    stop_loss_pct: float = 30.0
-    trailing_stop_activation_pct: float = 50.0
-    trailing_stop_distance_pct: float = 15.0
+    # Risk management - V3 tightened based on 85% false positive data
+    stop_loss_pct: float = 22.0  # was 30, drawdown avg -13% so cut earlier
+    trailing_stop_activation_pct: float = 35.0  # was 50, lock gains earlier
+    trailing_stop_distance_pct: float = 12.0  # was 15, tighter trail for meme volatility
     # Kept as a compatibility alias for older configurations.
-    trailing_stop_pct: float = 15.0
+    trailing_stop_pct: float = 12.0
     max_slippage_bps: int = 500
+
+    # Live anti-rug monitors - V3 faster exits
+    time_exceed_seconds: int = 180  # was 300, avg hold 2.3m =138s, but losers need faster cut
+    dev_dump_threshold_pct: float = 12.0  # was 15, more sensitive
+    liquidity_drop_threshold_pct: float = 40.0  # was 50
+    top_holder_spike_pct: float = 4.0  # was 5
+    enable_live_rug_checks: bool = True
+    live_rug_check_interval_seconds: int = 20  # was 30
+
+    # Bundle & manipulation filters - V3 tightened after 22% approval too high
+    max_bundle_risk_score: float = 60.0  # was 70/75
+    max_wash_score: float = 60.0  # was 70
+    max_sniper_saturation_score: float = 70.0  # was 80/85
+    max_mechanicality_score: float = 65.0  # was 75
+    min_sale_duration_seconds: float = 5.0
+    min_unique_trader_ratio: float = 0.35  # was 0.3, require more unique
+    enable_funding_cluster_check: bool = True
+    funding_cluster_max_checked: int = 12
+    max_funding_cluster_risk: float = 60.0  # was 70/75
+    serial_deployer_threshold: int = 3
 
     # Paper execution realism. Fees/slippage are deliberately explicit so
     # paper results are not confused with ideal quote returns.
@@ -59,16 +86,33 @@ class TradingConfig:
 
     # Smart-money confirmation must be convergent by default.
     min_confirming_whales: int = 2
+    max_whale_multiplier: float = 1.25
+    max_concurrent_whale_positions: int = 5
+    whale_min_trades: int = 20
+    whale_min_win_rate: float = 55.0
     gmgn_token_enrich_per_hour: int = 50
     signal_recheck_interval_seconds: int = 60
     signal_recheck_max_age_seconds: int = 1800
 
-    # Indicators & filters
-    min_liquidity_usd: float = 5000.0
-    min_market_cap_usd: float = 5000.0
-    min_buy_ratio: float = 0.6
-    min_unique_wallets: int = 10
-    max_top_holder_pct: float = 30.0
+    # Scanner tuning - selectivity over speed
+    pumpportal_buffer_seconds: int = 10
+    pumpfun_poll_interval_seconds: int = 3  # vs 30s before, still not 0-slot but 10x faster
+    gecko_poll_interval_seconds: int = 30
+    enable_pumpfun_api_scanner: bool = True
+    enable_gecko_scanner: bool = True
+
+    # Indicators & filters - V3: tighter for higher potential after 85% false positives
+    # Scanner level is fast pre-filter, scoring is where selectivity happens
+    min_liquidity_usd: float = 8000.0  # was 5000, require more exit liquidity
+    min_market_cap_usd: float = 8000.0  # was 5000
+    min_buy_ratio: float = 0.68  # was 0.60, need stronger buy pressure
+    min_unique_wallets: int = 10  # was 8, need more organic interest
+    max_top_holder_pct: float = 22.0  # was 30, tighten from 7 holder_concentration rejections only
+    min_dev_buy_sol_max: float = 50.0
+
+    def __post_init__(self):
+        if self.mcap_tp_levels is None:
+            self.mcap_tp_levels = [100000.0, 300000.0, 1000000.0, 3000000.0, 10000000.0]
 
     # Persistence/learning. These are deliberately separate files: trade
     # history is not mixed with the evolving whale/KOL list.

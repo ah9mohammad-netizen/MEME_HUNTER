@@ -1,9 +1,15 @@
 """
-MEME HUNTER - Main Bot
-======================
-The main bot that orchestrates all components for meme coin hunting.
+MEME HUNTER - Main Bot - Selectivity Focused Rewrite
+=====================================================
+Edge must be selectivity + slower confirmation, not 0-slot race.
 
-Optimized for Railway deployment with lightweight data fetching.
+Improvements:
+- 3 scanner stack: PumpPortal WS (buffer 10s, enhanced bundle detection), Pump.fun API poll 3s, LogsSubscribe (optional, processed commitment), Gecko new_pools
+- Configurable tightened filters: buy_ratio 0.65, unique 12
+- TradingEngine receives risk_analyzer for live rug checks
+- Whale multiplier capped, max concurrent whale positions
+- Rejection reasons extended for new MELT features
+- Enrichment tries bundle_detector funding cluster + serial deployer
 """
 
 import asyncio
@@ -17,7 +23,14 @@ from pathlib import Path
 
 from config import Config, config, TradingConfig
 from models import TokenSignal, TokenStatus, Position, Portfolio
-from token_scanner import TokenScanner, PumpPortalScanner, DexScreenerScanner, ScanFilters
+from token_scanner import (
+    TokenScanner,
+    PumpPortalScanner,
+    DexScreenerScanner,
+    PumpFunAPIScanner,
+    LogsSubscribeScanner,
+    ScanFilters
+)
 from risk_analyzer import RiskAnalyzer, WhaleTracker
 from capital_manager import CapitalManager
 from learning import TradeLearner
@@ -34,27 +47,22 @@ from whale_data import (
 )
 from telegram_bot import init_telegram
 
+# Optional enhanced detectors
+try:
+    from bundle_detector import detect_funding_clusters, check_serial_deployer
+    HAS_BUNDLE_DETECTOR = True
+except ImportError:
+    HAS_BUNDLE_DETECTOR = False
+
 logger = logging.getLogger(__name__)
 
 
 class MemeHunterBot:
-    """
-    Main meme hunting bot
-
-    Optimized for deployment on Railway with:
-    - Lightweight data fetching (aggressive caching)
-    - Telegram as the only UI
-    - Minimal API calls
-    """
-
     def __init__(self, config_path: str = None):
-        # Load JSON first, then let Railway environment variables override it.
         if config_path:
             Config.load_from_file(config_path)
         self._load_config()
 
-        # Two independent SQLite files: trade history/signals and wallets.
-        # STATE_DB_PATH remains accepted as a legacy alias for trade history.
         trade_path = config.TRADING.trade_history_db_path
         if config.TRADING.state_db_path != "trade_history.db":
             trade_path = config.TRADING.state_db_path
@@ -66,8 +74,6 @@ class MemeHunterBot:
         self.store = StateStore(trade_path)
         self.wallet_store = WalletStore(wallet_path)
 
-        # Paper mode is the default. It uses live public prices for realistic
-        # fills, but never loads a key or broadcasts a transaction.
         self.paper_mode = bool(config.TRADING.paper_trading)
         if self.paper_mode:
             price_client = SolanaTradingClient(
@@ -94,7 +100,6 @@ class MemeHunterBot:
                 wallet.min_buy_sol, copy_trade=wallet.copy_trade,
             )
 
-        # Load the wallet list from its own durable file.
         whale_fetcher.store = self.wallet_store
         for candidate in self.wallet_store.get_wallet_candidates(limit=100):
             whale_fetcher.add_wallet(
@@ -109,34 +114,28 @@ class MemeHunterBot:
         self.trading_engine = TradingEngine(
             self.client, capital_manager=self.capital_manager,
             store=self.store, learner=self.learner,
+            risk_analyzer=self.risk_analyzer,
         )
 
-        # Portfolio tracking (kept for compatibility with older callers).
         self.portfolio = Portfolio()
 
-        # Telegram bot
         self.telegram = None
         telegram_token = os.getenv("TELEGRAM_BOT_TOKEN")
         telegram_chat_id = os.getenv("TELEGRAM_CHAT_ID")
         if telegram_token and telegram_chat_id:
             self.telegram = init_telegram(telegram_token, telegram_chat_id, self.trading_engine)
 
-        # State
         self.running = False
         self.paused = False
         self.approved_tokens: Dict[str, TokenSignal] = {}
         self.scanned_mints: set = set()
         self.pending_signals: Dict[str, TokenSignal] = {}
-
-        # Price tracking (minimal)
         self.current_prices: Dict[str, float] = {}
 
-        # Setup signal handlers
         signal.signal(signal.SIGINT, self._signal_handler)
         signal.signal(signal.SIGTERM, self._signal_handler)
 
     def _load_config(self):
-        """Load capital, risk and persistence settings from environment."""
         cfg = config.TRADING
         env_map = {
             "MAX_POSITION_PER_COIN": ("max_position_per_coin", float),
@@ -150,7 +149,8 @@ class MemeHunterBot:
             "MAX_COINS_TRACKED": ("max_coins_tracked", int),
             "DCA_ENTRIES": ("dca_entries", int),
             "DCA_SPACING_PCT": ("dca_spacing_pct", float),
-            "DCA_WAIT_FOR_DIPS": ("dca_wait_for_dips", lambda value: str(value).lower() in {"1", "true", "yes"}),
+            "DCA_WAIT_FOR_DIPS": ("dca_wait_for_dips", lambda v: str(v).lower() in {"1","true","yes"}),
+            "DCA_COOLDOWN_SECONDS": ("dca_cooldown_seconds", int),
             "GRID_LEVELS": ("grid_levels", int),
             "STOP_LOSS_PCT": ("stop_loss_pct", float),
             "TRAILING_STOP_PCT": ("trailing_stop_pct", float),
@@ -160,45 +160,59 @@ class MemeHunterBot:
             "PAPER_FEE_BPS": ("paper_fee_bps", int),
             "PAPER_SLIPPAGE_BPS": ("paper_slippage_bps", int),
             "MIN_CONFIRMING_WHALES": ("min_confirming_whales", int),
+            "MAX_WHALE_MULTIPLIER": ("max_whale_multiplier", float),
+            "MAX_CONCURRENT_WHALE_POSITIONS": ("max_concurrent_whale_positions", int),
+            "TIME_EXCEED_SECONDS": ("time_exceed_seconds", int),
+            "DEV_DUMP_THRESHOLD_PCT": ("dev_dump_threshold_pct", float),
+            "LIQUIDITY_DROP_THRESHOLD_PCT": ("liquidity_drop_threshold_pct", float),
+            "MAX_BUNDLE_RISK_SCORE": ("max_bundle_risk_score", float),
+            "MAX_WASH_SCORE": ("max_wash_score", float),
+            "MAX_SNIPER_SATURATION_SCORE": ("max_sniper_saturation_score", float),
+            "PUMPFUN_POLL_INTERVAL_SECONDS": ("pumpfun_poll_interval_seconds", int),
+            "GECKO_POLL_INTERVAL_SECONDS": ("gecko_poll_interval_seconds", int),
             "GMGN_TOKEN_ENRICH_PER_HOUR": ("gmgn_token_enrich_per_hour", int),
             "LEARNED_WALLET_MIN_PROFIT_SOL": ("learned_wallet_min_profit_sol", float),
             "TRADE_HISTORY_DB_PATH": ("trade_history_db_path", str),
             "WALLETS_DB_PATH": ("wallets_db_path", str),
             "PAPER_STARTING_BALANCE_SOL": ("paper_starting_balance_sol", float),
+            "HELIUS_API_KEY": ("helius_api_key", str),
+            "HELIUS_RPC_WS": ("helius_rpc_ws", str),
+            "LOGS_SUBSCRIBE_ENABLED": ("logs_subscribe_enabled", lambda v: str(v).lower() in {"1","true","yes"}),
         }
-        for env_name, (attribute, converter) in env_map.items():
+        for env_name, (attr, conv) in env_map.items():
             value = os.getenv(env_name)
             if value is not None:
                 try:
-                    setattr(cfg, attribute, converter(value))
+                    setattr(cfg, attr, conv(value))
                 except ValueError:
                     logger.warning("Ignoring invalid %s=%r", env_name, value)
         if os.getenv("RPC_ENDPOINT"):
             cfg.rpc_endpoint = os.getenv("RPC_ENDPOINT")
         if os.getenv("WALLET_PRIVATE_KEY"):
             cfg.wallet_private_key = os.getenv("WALLET_PRIVATE_KEY")
+        if os.getenv("HELIUS_RPC_URL"):
+            cfg.helius_rpc_ws = os.getenv("HELIUS_RPC_URL").replace("https://", "wss://")
         legacy_trade_path = os.getenv("STATE_DB_PATH") or os.getenv("DB_PATH")
         if legacy_trade_path:
             cfg.trade_history_db_path = legacy_trade_path
             cfg.state_db_path = legacy_trade_path
         if os.getenv("PAPER_TRADING") is not None:
-            cfg.paper_trading = os.getenv("PAPER_TRADING", "true").lower() in {"1", "true", "yes"}
+            cfg.paper_trading = os.getenv("PAPER_TRADING", "true").lower() in {"1","true","yes"}
         if os.getenv("AUTO_LEARN_WALLETS") is not None:
-            cfg.auto_learn_wallets = os.getenv("AUTO_LEARN_WALLETS", "true").lower() in {"1", "true", "yes"}
+            cfg.auto_learn_wallets = os.getenv("AUTO_LEARN_WALLETS", "true").lower() in {"1","true","yes"}
         logger.info(
-            "Configuration loaded: mode=%s, trade_db=%s, wallet_db=%s",
+            "Config loaded: mode=%s trade_db=%s wallet_db=%s selectors: bundle<%.0f sniper<%.0f time_exceed=%ss pump_poll=%ss logs=%s",
             "paper" if cfg.paper_trading else "live",
-            cfg.trade_history_db_path,
-            cfg.wallets_db_path,
+            cfg.trade_history_db_path, cfg.wallets_db_path,
+            cfg.max_bundle_risk_score, cfg.max_sniper_saturation_score,
+            cfg.time_exceed_seconds, cfg.pumpfun_poll_interval_seconds, cfg.logs_subscribe_enabled
         )
 
     def _signal_handler(self, signum, frame):
-        """Handle shutdown signals"""
         logger.info("Shutdown signal received, cleaning up...")
         self.running = False
 
     async def _health_monitor(self):
-        """Tiny internal Railway health endpoint; Telegram remains the only UI."""
         port = int(os.getenv("PORT", "8080"))
         try:
             async def handle(reader, writer):
@@ -214,7 +228,6 @@ class MemeHunterBot:
                 finally:
                     writer.close()
                     await writer.wait_closed()
-
             server = await asyncio.start_server(handle, "0.0.0.0", port)
             logger.info("Health endpoint listening on port %s", port)
             while self.running:
@@ -225,21 +238,18 @@ class MemeHunterBot:
             logger.warning("Health endpoint unavailable: %s", exc)
 
     async def start(self):
-        """Start the bot"""
-        logger.info("=" * 60)
-        logger.info("🚀 MEME HUNTER BOT STARTING")
-        logger.info("=" * 60)
+        logger.info("="*60)
+        logger.info("🚀 MEME HUNTER BOT STARTING - Selectivity Framework")
+        logger.info("="*60)
 
-        # Check wallet
         balance = await self.client.get_balance()
         if self.paper_mode:
             logger.info(f"Paper balance: {balance:.4f} SOL (no live transactions)")
         else:
             logger.info(f"Wallet balance: {balance:.4f} SOL")
             if balance < 0.1:
-                logger.warning("Low SOL balance! Ensure you have at least 0.1 SOL for trading")
+                logger.warning("Low SOL balance! Ensure at least 0.1 SOL")
 
-        # Initialize scanners
         filters = ScanFilters(
             min_dev_buy_sol=config.TRADING.min_dev_buy_sol,
             min_market_cap_sol=config.TRADING.min_market_cap_usd / 200,
@@ -249,28 +259,39 @@ class MemeHunterBot:
             min_buy_ratio=config.TRADING.min_buy_ratio
         )
 
-        # Add scanners
-        self.scanner.add_scanner(PumpPortalScanner(filters))
-        self.scanner.add_scanner(DexScreenerScanner(filters))
+        # === Selectivity scanner stack ===
+        # Primary: PumpPortal WS with enhanced bundle detection
+        self.scanner.add_scanner(PumpPortalScanner(filters, buffer_duration=config.TRADING.pumpportal_buffer_seconds))
 
-        # Set the capital baseline. With a 1 SOL wallet and defaults this
-        # permits roughly 0.1 SOL per meme and keeps at least 0.05 SOL free.
+        # NEW: Pump.fun API polling every 3s - 10x faster than Gecko
+        if config.TRADING.enable_pumpfun_api_scanner:
+            self.scanner.add_scanner(PumpFunAPIScanner(filters, poll_interval=config.TRADING.pumpfun_poll_interval_seconds))
+
+        # Gecko new_pools still for migration detection
+        if config.TRADING.enable_gecko_scanner:
+            self.scanner.add_scanner(DexScreenerScanner(filters, poll_interval=config.TRADING.gecko_poll_interval_seconds))
+
+        # Optional: logsSubscribe at processed for near-real-time (requires Helius WSS)
+        if config.TRADING.logs_subscribe_enabled:
+            ws_url = config.TRADING.helius_rpc_ws or os.getenv("HELIUS_WSS_URL", "")
+            http_url = config.TRADING.rpc_endpoint
+            if ws_url:
+                logger.info(f"Enabling LogsSubscribe scanner: {ws_url[:40]}...")
+                self.scanner.add_scanner(LogsSubscribeScanner(filters, ws_url=ws_url, http_url=http_url))
+            else:
+                logger.warning("LOGS_SUBSCRIBE_ENABLED but no HELIUS_RPC_WS set - skipping")
+
         self.capital_manager.set_balance(balance)
         if self.paper_mode:
-            # Keep the allocation baseline at the configured opening balance,
-            # even after paper profits/losses or a restart.
             self.capital_manager.reference_balance_sol = config.TRADING.paper_starting_balance_sol
         self.portfolio.starting_balance_sol = config.TRADING.paper_starting_balance_sol if self.paper_mode else balance
         self.portfolio.current_balance_sol = balance
 
-        # Start main loop
         self.running = True
 
-        # Start Telegram bot if configured
         if self.telegram:
             asyncio.create_task(self.telegram.start())
 
-        # Start main tasks
         tasks = [
             self._health_monitor(),
             self._run_scanner(),
@@ -278,21 +299,16 @@ class MemeHunterBot:
             self._run_position_monitor(),
             self._run_balance_monitor(),
             self._run_signal_recheck(),
-            self._run_whale_updater(),      # Lightweight: updates whale list periodically
+            self._run_whale_updater(),
             self._run_status_reporting()
         ]
-
         await asyncio.gather(*tasks)
 
     async def _run_whale_updater(self):
-        """Periodically update whale list from GMGN"""
         logger.info("Starting whale updater...")
-
         first_run = True
         while self.running:
             try:
-                # Run once promptly, then only every 30 minutes. This task is
-                # independent from scanning, so GMGN latency cannot block trades.
                 if not first_run:
                     await asyncio.sleep(1800)
                 first_run = False
@@ -308,9 +324,7 @@ class MemeHunterBot:
                 await asyncio.sleep(30)
 
     async def _run_scanner(self):
-        """Run the token scanner"""
-        logger.info("Starting token scanner...")
-
+        logger.info("Starting token scanner stack...")
         try:
             await self.scanner.start(self._handle_token_signal)
         except Exception as e:
@@ -318,10 +332,13 @@ class MemeHunterBot:
 
     @staticmethod
     def _classify_signal(signal: TokenSignal, whale_summary: Optional[Dict] = None) -> List[str]:
-        """Assign independent strategy labels; do not collapse them into score."""
         labels = {"normal_scanner"}
-        if signal.source in {"pumpfun_new", "gecko_new_pool"}:
+        if signal.source in {"pumpfun_new", "pumpfun_api", "logs_subscribe", "gecko_new_pool"}:
             labels.add("new_pair")
+        if signal.source == "logs_subscribe":
+            labels.add("logs_detected")
+        if signal.source == "pumpfun_api":
+            labels.add("pumpfun_api")
         if signal.behavior_data.get("migration"):
             labels.add("migration")
         if signal.twitter_mentions or signal.telegram_members or signal.behavior_data.get("social_catalyst"):
@@ -332,6 +349,10 @@ class MemeHunterBot:
             labels.add("kol_confirmation")
         if any(item.get("source") in {"gmgn", "smartmoney"} for item in buys):
             labels.add("smart_money_confirmation")
+        if signal.behavior_data.get("sniper_saturation_score", 0) >= 80:
+            labels.add("sniper_saturated")
+        if signal.behavior_data.get("bundle_risk_score", 0) >= 70:
+            labels.add("bundle_risk")
         return sorted(labels)
 
     @staticmethod
@@ -349,15 +370,44 @@ class MemeHunterBot:
             ("wash_trading_suspected", "wash_trading"),
             ("bundle_risk_suspected", "bundle_risk"),
             ("creator_sold_early", "creator_sold"),
+            ("sniper_saturation_suspected", "sniper_saturated"),
+            ("funding_cluster_suspected", "funding_cluster"),
+            ("serial_deployer_suspected", "serial_deployer"),
         ):
             if getattr(risk_report, flag, False):
                 return reason
         if risk_report.overall_score < 50:
             return "risk_score_below_50"
-        if signal.source == "gecko_new_pool" and not signal.behavior_data.get("gmgn_enriched"):
-            return "launch_quality_data_unavailable"
-        if signal.overall_score < 60 and not signal.is_whale_alert:
-            return "opportunity_score_below_60"
+        # New MELT-based rejections from behavior directly even if risk gate technically passed
+        bd = signal.behavior_data or {}
+        if float(bd.get("sniper_saturation_score", 0) or 0) >= config.TRADING.max_sniper_saturation_score:
+            return f"sniper_saturation_{bd.get('sniper_saturation_score')}"
+        if float(bd.get("bundle_risk_score", 0) or 0) >= config.TRADING.max_bundle_risk_score:
+            return f"bundle_risk_{bd.get('bundle_risk_score')}"
+        if float(bd.get("wash_trading_score", 0) or 0) >= config.TRADING.max_wash_score:
+            return f"wash_trading_{bd.get('wash_trading_score')}"
+        if float(bd.get("cluster_risk_score", 0) or 0) >= config.TRADING.max_funding_cluster_risk:
+            return f"funding_cluster_{bd.get('cluster_risk_score')}"
+        if bd.get("is_serial_deployer"):
+            return "serial_deployer"
+
+        # V3: migrations need risk >=62 now after 7.7% win rate
+        is_migration = bool(bd.get("migration"))
+        if signal.source == "gecko_new_pool" and not bd.get("gmgn_enriched"):
+            if is_migration and risk_report.overall_score >= 62 and signal.liquidity_sol >= 8:
+                pass
+            else:
+                return "launch_quality_data_unavailable"
+
+        # V3 thresholds tightened after 22% approval too high
+        threshold = 55
+        if signal.source in {"pumpfun_new", "pumpfun_api", "logs_subscribe"}:
+            threshold = 52
+        if is_migration:
+            threshold = 50
+
+        if signal.overall_score < threshold and not signal.is_whale_alert:
+            return f"opportunity_score_below_{threshold}"
         if signal.is_whale_alert and (whale_summary or {}).get("total_sol", 0) < 2:
             return "smart_money_amount_below_2_sol"
         return "not_approved"
@@ -385,15 +435,18 @@ class MemeHunterBot:
         }
 
     async def _enrich_signal_from_gmgn(self, signal: TokenSignal) -> bool:
-        """Use a small, rate-limited GMGN token snapshot for near-threshold pools."""
-        if signal.source != "gecko_new_pool" or not (30 <= signal.overall_score < 70):
-            return False
-        if signal.liquidity_sol < config.TRADING.min_liquidity_usd / 200:
-            return False
+        """GMGN enrichment for near-threshold pools + optional bundle funding cluster"""
+        if signal.source not in {"gecko_new_pool", "pumpfun_api", "logs_subscribe"}:
+            # Only enrich pools that are borderline or have low quality data
+            if signal.overall_score >= 70:
+                return False
+        if signal.liquidity_sol < config.TRADING.min_liquidity_usd / 200 and signal.source == "gecko_new_pool":
+            # Still need min liquidity for enrich to be worth credit
+            pass
+
         info = await whale_fetcher.fetch_token_info(signal.mint)
         if not info:
             return False
-        # CLI versions may wrap the token object in data/token/stat/security.
         token = info.get("token", info.get("data", info)) if isinstance(info, dict) else {}
         if isinstance(token, dict) and isinstance(token.get("data"), dict):
             token = token["data"]
@@ -433,20 +486,41 @@ class MemeHunterBot:
         signal.calculate_overall_score()
         return True
 
+    async def _enrich_with_bundle_detector(self, signal: TokenSignal):
+        """Optional deeper enrichment using bundle_detector if available"""
+        if not HAS_BUNDLE_DETECTOR:
+            return
+        try:
+            # Funding cluster check if enabled and we have early buyers
+            if config.TRADING.enable_funding_cluster_check and signal.behavior_data.get("early_buyer_count", 0) >= 5:
+                # We don't have wallet list here directly, but behavior_data has observed traders count
+                # For deeper check, we would need actual wallet addresses - store from scanner if available
+                # For now, only check serial deployer if creator known
+                if signal.creator_address:
+                    deployer_info = await check_serial_deployer(signal.creator_address)
+                    if deployer_info.get("is_serial_deployer"):
+                        signal.behavior_data.update({
+                            "is_serial_deployer": True,
+                            "serial_deployer_risk_score": deployer_info.get("risk_score", 35.0),
+                            "deployed_count_recent": deployer_info.get("deployed_count_recent", 0)
+                        })
+                        signal.calculate_overall_score()
+        except Exception as e:
+            logger.debug(f"Bundle detector enrichment failed: {e}")
+
     async def _handle_token_signal(self, signal: TokenSignal, allow_recheck: bool = False):
-        """Handle or re-evaluate a discovered token signal."""
         if signal.mint in self.scanned_mints and not allow_recheck:
             return
-
         self.scanned_mints.add(signal.mint)
 
         logger.info(
-            f"🔍 NEW SIGNAL: {signal.name} ({signal.symbol})\n"
+            f"🔍 NEW SIGNAL [{signal.source}]: {signal.name} ({signal.symbol})\n"
             f"   Mint: {signal.mint[:16]}...\n"
             f"   Dev Buy: {signal.dev_buy_sol:.2f} SOL\n"
             f"   Market Cap: ${signal.market_cap_sol * 200:.2f}\n"
             f"   Buy Ratio: {signal.buy_ratio:.1%}\n"
-            f"   Score: {signal.overall_score:.1f}"
+            f"   Unique: {signal.unique_wallets} wallets\n"
+            f"   Score: {signal.overall_score:.1f} | Bundle:{signal.behavior_data.get('bundle_risk_score',0)} Wash:{signal.behavior_data.get('wash_trading_score',0)} Sniper:{signal.behavior_data.get('sniper_saturation_score',0)}"
         )
         if not allow_recheck:
             self.store.record_signal(
@@ -466,9 +540,6 @@ class MemeHunterBot:
                 decision="discovered",
             )
 
-        # Enrich near-threshold Gecko pools before the score gate. This is
-        # deliberately rate-limited so GMGN credits are not spent on every
-        # low-quality launch.
         if not self.paused:
             enriched = await self._enrich_signal_from_gmgn(signal)
             if enriched:
@@ -479,8 +550,8 @@ class MemeHunterBot:
                     approved=False,
                     features=self._signal_features(signal),
                 )
+            await self._enrich_with_bundle_detector(signal)
 
-        # Skip if score too low or paused
         if self.paused:
             self.store.update_signal_observations(
                 signal.signal_run_id, strategy_types=signal.strategy_types,
@@ -499,10 +570,29 @@ class MemeHunterBot:
                 features=self._signal_features(signal),
             )
             self.pending_signals[signal.mint] = signal
-            logger.info(f"   ⏭️ Score too low, queued for recheck")
+            logger.info(f"   ⏭️ Score too low ({signal.overall_score:.1f}), queued for recheck")
             return
 
-        # Perform risk analysis
+        # Pre-filter for MELT fast-fail before expensive RPC calls
+        bd = signal.behavior_data
+        if float(bd.get("sniper_saturation_score", 0) or 0) >= config.TRADING.max_sniper_saturation_score:
+            logger.info(f"   ❌ REJECTED pre-risk: sniper saturated {bd.get('sniper_saturation_score')}")
+            rejection = f"sniper_saturated_{bd.get('sniper_saturation_score')}"
+            self.store.update_signal_observations(
+                signal.signal_run_id, strategy_types=signal.strategy_types,
+                decision="rejected", approved=False, rejection_reason=rejection,
+                features=self._signal_features(signal)
+            )
+            self.store.record_signal(
+                mint=signal.mint, symbol=signal.symbol, name=signal.name,
+                score=signal.overall_score, dev_buy_sol=signal.dev_buy_sol,
+                market_cap_sol=signal.market_cap_sol, liquidity_sol=signal.liquidity_sol,
+                buy_ratio=signal.buy_ratio, unique_wallets=signal.unique_wallets,
+                decision="rejected", reason=rejection,
+                metadata={"behavior": bd}
+            )
+            return
+
         risk_report = await self.risk_analyzer.analyze(
             signal.mint,
             market_data={
@@ -518,29 +608,25 @@ class MemeHunterBot:
             f"   Recommendation: {risk_report.get_recommendation()}\n"
             f"   Data: {risk_report.check_status or {}}"
         )
-
         if risk_report.warnings:
-            for warning in risk_report.warnings[:3]:
+            for warning in risk_report.warnings[:4]:
                 logger.info(f"   {warning}")
 
-        # Check whale activity - USE LIGHTWEIGHT FETCHER
         whale_summary = {
             "total_sol": 0.0, "total_buys": 0, "wallet_count": 0,
             "all_buys": [], "top_buyer": None,
         }
         try:
             whale_summary = await get_whale_activity_for_token(signal.mint)
-
             if whale_summary["total_sol"] > 0:
                 logger.info(
                     f"   🐋 Whale Activity:\n"
                     f"   Total Buys: {whale_summary['total_buys']}\n"
                     f"   Total SOL: {whale_summary['total_sol']:.2f}\n"
+                    f"   Wallets: {whale_summary.get('wallet_count',0)}\n"
                     f"   Signal: {whale_summary['signal']}\n"
                     f"   Conviction: {whale_summary['conviction']}"
                 )
-                # Require convergence from multiple distinct wallets for a
-                # whale alert; one large wallet is evidence, not confirmation.
                 signal.is_whale_alert = (
                     whale_summary["total_sol"] > 1
                     and whale_summary.get("wallet_count", 0) >= config.TRADING.min_confirming_whales
@@ -551,12 +637,8 @@ class MemeHunterBot:
         except Exception as e:
             logger.warning(f"Whale check failed (non-critical): {e}")
 
-        # Recalculate the bounded opportunity score now that smart-money
-        # context is known.
         signal.calculate_overall_score()
 
-        # Use persisted actor outcomes as a small, explainable adjustment.
-        # Historical evidence never overrides the risk gate.
         if signal.kol_wallets:
             adjustment = self.learner.confidence_adjustment(signal.kol_wallets)
             signal.overall_score = max(0.0, signal.overall_score + adjustment)
@@ -573,18 +655,37 @@ class MemeHunterBot:
             decision="evaluated",
         )
 
-        # Decision making
         should_trade = False
-
         if risk_report.is_tradeable(min_score=50):
-            launch_data_ok = (
-                signal.source != "gecko_new_pool"
-                or bool(signal.behavior_data.get("gmgn_enriched"))
-            )
-            if launch_data_ok and signal.overall_score >= 60:
-                should_trade = True
+            bd = signal.behavior_data or {}
+            is_migration = bool(bd.get("migration"))
+
+            # V3 FIX: allow migrations even without GMGN enrichment if risk good
+            if signal.source == "gecko_new_pool" and not bd.get("gmgn_enriched"):
+                if is_migration and risk_report.overall_score >= 62:
+                    launch_data_ok = True
+                else:
+                    launch_data_ok = False
+            else:
+                launch_data_ok = True
+
+            # V3 tiered thresholds – tightened after 22% approval too high, need 8-10%
+            # Based on performance: 14% win rate, need higher bar
+            threshold = 55
+            if signal.source in {"pumpfun_new", "pumpfun_api", "logs_subscribe"}:
+                threshold = 52
+            if is_migration:
+                threshold = 50  # migrations were worst 7.7% win, require higher risk but lower score?
+
+            if launch_data_ok and signal.overall_score >= threshold:
+                # Extra selectivity: require bundle <60 and sniper <70 already in risk gate,
+                # but also require buy_ratio >=0.70 and unique >=10 for final approval
+                if signal.buy_ratio >= 0.65 and signal.unique_wallets >= 8:
+                    should_trade = True
             elif launch_data_ok and signal.is_whale_alert and whale_summary["total_sol"] >= 2:
-                should_trade = True
+                # Whale-assisted can be slightly lower but still selective
+                if signal.overall_score >= 50:
+                    should_trade = True
 
         decision = "approved" if should_trade else "rejected"
         rejection_reason = None if should_trade else self._rejection_reason(signal, risk_report, whale_summary)
@@ -615,10 +716,8 @@ class MemeHunterBot:
         )
 
         if should_trade:
-            logger.info(f"   ✅ APPROVED FOR TRADING")
+            logger.info(f"   ✅ APPROVED FOR TRADING (score {signal.overall_score:.1f} risk {risk_report.overall_score:.1f})")
             self.approved_tokens[signal.mint] = signal
-
-            # Send Telegram alert
             if self.telegram:
                 await self.telegram.alert_new_signal({
                     "name": signal.name,
@@ -629,8 +728,6 @@ class MemeHunterBot:
                     "buy_ratio": signal.buy_ratio,
                     "is_whale_alert": signal.is_whale_alert
                 })
-
-            # Auto-open position if strong signal
             if signal.overall_score >= 70 or (signal.is_whale_alert and whale_summary["total_sol"] > 2):
                 logger.info(f"   🚀 STRONG SIGNAL - Opening position...")
                 await self._open_position(signal)
@@ -644,17 +741,12 @@ class MemeHunterBot:
             logger.info(f"   ❌ REJECTED - {rejection_reason or 'unknown reason'}")
 
     async def _open_position(self, signal: TokenSignal):
-        """Open a trading position"""
         if signal.mint in self.trading_engine.active_positions:
             return
-
-        # Check if we can open new position
         if len(self.trading_engine.active_positions) >= config.TRADING.max_coins_tracked:
             logger.warning("Max positions reached!")
             return
 
-        # Calculate a request from conviction; CapitalManager applies the hard
-        # per-meme percentage/absolute cap and checks the live free balance.
         base_size = self.capital_manager.position_cap_sol()
         if signal.overall_score >= 80:
             size = base_size
@@ -662,8 +754,15 @@ class MemeHunterBot:
             size = base_size * 0.75
         else:
             size = base_size * 0.5
+
         if signal.is_whale_alert:
-            size *= 1.25
+            # Capped multiplier - new: max_whale_multiplier default 1.25 but capped by position cap
+            size = min(size * config.TRADING.max_whale_multiplier, base_size * config.TRADING.max_whale_multiplier)
+
+            # Reduce size if funding cluster risk present even if approved
+            if float(signal.behavior_data.get("cluster_risk_score", 0) or 0) > 30:
+                size *= 0.7
+                logger.info(f"   ⚠️ Funding cluster risk {signal.behavior_data.get('cluster_risk_score')} → reducing size to {size:.4f} SOL")
 
         position = await self.trading_engine.open_position(signal, sol_budget=size)
 
@@ -673,11 +772,12 @@ class MemeHunterBot:
                 f"   Entry: {position.entry_price:.8f} SOL\n"
                 f"   Invested: {position.total_invested_sol:.4f} SOL\n"
                 f"   Tokens: {position.total_tokens:.2f}\n"
-                f"   Stop Loss: {position.stop_loss_price:.8f} SOL"
+                f"   Stop Loss: {position.stop_loss_price:.8f} SOL\n"
+                f"   Initial Liq: {position.initial_liquidity_sol:.2f} SOL\n"
+                f"   Creator: {position.creator_address or 'unknown'[:12]}"
             )
 
     async def _run_balance_monitor(self):
-        """Reconcile free SOL and persist a portfolio snapshot periodically."""
         while self.running:
             try:
                 await self.capital_manager.refresh()
@@ -689,7 +789,6 @@ class MemeHunterBot:
                 await asyncio.sleep(30)
 
     async def _run_signal_recheck(self):
-        """Revisit signals while launch/risk APIs catch up with new tokens."""
         while self.running:
             await asyncio.sleep(config.TRADING.signal_recheck_interval_seconds)
             now = datetime.now()
@@ -704,96 +803,64 @@ class MemeHunterBot:
                     logger.warning("Signal recheck failed for %s: %s", mint[:12], exc)
 
     async def _run_price_monitor(self):
-        """Monitor token prices"""
         logger.info("Starting price monitor...")
-
         while self.running:
             try:
-                # Update prices for active positions
                 for mint in list(self.trading_engine.active_positions.keys()):
                     price = await self.client.get_token_price(mint)
                     if price > 0:
                         self.current_prices[mint] = price
-
-                await asyncio.sleep(5)  # Update every 5 seconds
-
+                await asyncio.sleep(5)
             except Exception as e:
                 logger.error(f"Price monitor error: {e}")
                 await asyncio.sleep(10)
 
     async def _run_position_monitor(self):
-        """Monitor and manage positions"""
-        logger.info("Starting position monitor...")
-
+        logger.info("Starting position monitor with live rug checks...")
         while self.running:
             try:
                 if self.trading_engine.active_positions:
                     await self.trading_engine.monitor_positions(self.current_prices)
-
-                await asyncio.sleep(3)  # Check every 3 seconds
-
+                await asyncio.sleep(3)
             except Exception as e:
                 logger.error(f"Position monitor error: {e}")
                 await asyncio.sleep(10)
 
-    async def _run_telegram_alerts(self):
-        """Send periodic Telegram alerts"""
-        # Now handled by telegram_bot directly
-        # This method kept for backwards compatibility
-        pass
-
     async def _run_status_reporting(self):
-        """Print periodic status reports"""
         while self.running:
-            await asyncio.sleep(60)  # Report every minute
-
+            await asyncio.sleep(60)
             summary = self.trading_engine.get_portfolio_summary()
-
-            logger.info("=" * 60)
-            logger.info("📊 PORTFOLIO STATUS")
-            logger.info("=" * 60)
+            logger.info("="*60)
+            logger.info("📊 PORTFOLIO STATUS - Selectivity Framework")
+            logger.info("="*60)
             logger.info(f"Active Positions: {summary['active_positions']}")
             logger.info(f"Total Invested: {summary['total_invested_sol']:.4f} SOL")
             logger.info(f"Unrealized PnL: {summary['unrealized_pnl_sol']:.4f} SOL")
             logger.info(f"Realized PnL: {summary['realized_pnl_sol']:.4f} SOL")
             logger.info(f"Total PnL: {summary['total_pnl_sol']:.4f} SOL")
-
+            logger.info(f"Available: {summary['available_sol']:.4f} SOL | Committed: {summary['committed_sol']:.4f} SOL")
             if summary['positions']:
                 logger.info("\nPosition Details:")
                 for pos in summary['positions']:
                     logger.info(
                         f"  {pos['symbol']}: {pos['pnl_pct']:+.1f}% "
-                        f"(Grid: {pos['grid_sold_pct']:.0f}% sold)"
+                        f"(Grid: {pos['grid_sold_pct']:.0f}% sold Hold: {pos['hold_seconds']:.0f}s)"
                     )
-
-            logger.info("=" * 60)
+            logger.info("="*60)
 
     async def close_all_positions(self):
-        """Emergency close all positions"""
         logger.warning("Closing all positions...")
-
         for mint in list(self.trading_engine.active_positions.keys()):
             await self.trading_engine.close_position(mint, "Emergency close all")
 
 
 class Backtester:
-    """
-    Backtest trading strategies on historical data
-    """
-
     def __init__(self):
         self.trades = []
         self.initial_balance = 10.0
         self.balance = self.initial_balance
 
     async def run_backtest(self, signals: List[Dict], price_data: Dict):
-        """
-        Run backtest on historical signals
-
-        Args:
-            signals: List of signal dicts with entry/exit points
-            price_data: Historical price data
-        """
         results = {
             "total_trades": 0,
             "winning_trades": 0,
@@ -802,55 +869,37 @@ class Backtester:
             "max_drawdown": 0.0,
             "sharpe_ratio": 0.0
         }
-
         for signal in signals:
             entry_price = signal["entry_price"]
             exit_price = signal["exit_price"]
             position_size = signal["position_size"]
             direction = signal.get("direction", "long")
-
-            if direction == "long":
-                pnl_pct = (exit_price - entry_price) / entry_price
-            else:
-                pnl_pct = (entry_price - exit_price) / entry_price
-
+            pnl_pct = (exit_price - entry_price) / entry_price if direction == "long" else (entry_price - exit_price) / entry_price
             pnl_sol = position_size * pnl_pct
-
             results["total_trades"] += 1
             if pnl_sol > 0:
                 results["winning_trades"] += 1
             else:
                 results["losing_trades"] += 1
-
             results["total_pnl"] += pnl_sol
             self.balance += pnl_sol
-
-        # Calculate metrics
         if results["total_trades"] > 0:
             results["win_rate"] = results["winning_trades"] / results["total_trades"]
-
         results["final_balance"] = self.balance
         results["total_return"] = (self.balance - self.initial_balance) / self.initial_balance * 100
-
         return results
 
 
 class PaperTrader(MemeHunterBot):
-    """
-    Paper trading mode - simulates trades without real execution
-    """
-
     def __init__(self):
         super().__init__()
-        self.paper_balance = 10.0  # Starting paper balance
-        self.positions = {}  # Track paper positions
+        self.paper_balance = 10.0
+        self.positions = {}
         self.trade_history = []
 
     async def execute_buy(self, mint: str, symbol: str, sol_amount: float) -> Dict:
-        """Simulate buy"""
         price = await self.client.get_token_price(mint)
         tokens = sol_amount / price if price > 0 else 0
-
         self.paper_balance -= sol_amount
         self.positions[mint] = {
             "symbol": symbol,
@@ -859,35 +908,22 @@ class PaperTrader(MemeHunterBot):
             "entry_time": datetime.now(),
             "invested": sol_amount
         }
-
         logger.info(f"📝 PAPER BUY: {tokens:.2f} {symbol} @ {price:.8f} SOL")
-
-        return {
-            "success": True,
-            "tokens_received": tokens,
-            "price": price
-        }
+        return {"success": True, "tokens_received": tokens, "price": price}
 
     async def execute_sell(self, mint: str, percentage: int = 100) -> Dict:
-        """Simulate sell"""
         if mint not in self.positions:
             return {"success": False, "error": "No position"}
-
         position = self.positions[mint]
         price = await self.client.get_token_price(mint)
-
         tokens_to_sell = position["tokens"] * (percentage / 100)
         sol_received = tokens_to_sell * price
-
         pnl = sol_received - position["invested"]
-
         self.paper_balance += sol_received
         position["tokens"] -= tokens_to_sell
         position["invested"] -= position["invested"] * (percentage / 100)
-
-        if position["tokens"] <= 0.001:  # Dust threshold
+        if position["tokens"] <= 0.001:
             del self.positions[mint]
-
         self.trade_history.append({
             "type": "sell",
             "symbol": position["symbol"],
@@ -897,25 +933,15 @@ class PaperTrader(MemeHunterBot):
             "pnl": pnl,
             "time": datetime.now()
         })
-
         logger.info(f"📝 PAPER SELL: {tokens_to_sell:.2f} {position['symbol']} @ {price:.8f} SOL | PnL: {pnl:+.4f} SOL")
-
-        return {
-            "success": True,
-            "sol_received": sol_received,
-            "pnl": pnl,
-            "price": price
-        }
+        return {"success": True, "sol_received": sol_received, "pnl": pnl, "price": price}
 
     def get_paper_balance(self) -> Dict:
-        """Get current paper trading balance"""
         positions_value = 0
         for mint, pos in self.positions.items():
             price = self.current_prices.get(mint, pos["entry_price"])
             positions_value += pos["tokens"] * price
-
         total_value = self.paper_balance + positions_value
-
         return {
             "balance": self.paper_balance,
             "positions_value": positions_value,
@@ -928,20 +954,12 @@ class PaperTrader(MemeHunterBot):
 
 
 async def main():
-    """Main entry point"""
-    # Setup logging
     logging.basicConfig(
         level=logging.INFO,
         format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-        handlers=[
-            logging.StreamHandler(),
-            logging.FileHandler('meme_hunter.log')
-        ]
+        handlers=[logging.StreamHandler(), logging.FileHandler('meme_hunter.log')]
     )
-
-    # Initialize bot
     bot = MemeHunterBot()
-
     try:
         await bot.start()
     except KeyboardInterrupt:

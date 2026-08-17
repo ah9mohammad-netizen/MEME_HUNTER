@@ -166,7 +166,7 @@ class GridLevel:
 
 @dataclass
 class Position:
-    """Active trading position"""
+    """Active trading position - extended for selectivity framework"""
     token_mint: str
     token_symbol: str
 
@@ -177,6 +177,16 @@ class Position:
     # Cost basis of tokens still held.  This is separate from total_invested_sol
     # because grid sells realize part of the original cost basis.
     remaining_cost_sol: float = 0.0
+
+    # Live anti-rug context - new for selectivity framework
+    initial_liquidity_sol: float = 0.0
+    initial_liquidity_usd: float = 0.0
+    initial_dev_token_balance: float = 0.0
+    creator_address: Optional[str] = None
+    creation_timestamp: Optional[datetime] = None
+    last_rug_check_at: Optional[datetime] = None
+    last_dca_fill_at: Optional[datetime] = None
+    live_checks_failed: int = 0
 
     # Signal/actor context is persisted with the position so profitable tokens
     # can improve the whale/KOL list after a restart.
@@ -277,43 +287,125 @@ class TokenSignal:
     discovered_at: datetime = field(default_factory=datetime.now)
 
     def calculate_overall_score(self) -> float:
-        """Calculate a bounded 0–100 opportunity score.
+        """Calculate a bounded 0–100 opportunity score with enhanced MELT-inspired penalties.
 
-        The previous score could exceed 100 and allowed low market cap alone
-        to dominate the decision. This version keeps opportunity, market
-        quality, momentum and smart-money context separate. Risk analysis is
-        still an independent hard gate.
+        Keeps opportunity, quality, momentum and smart-money separate.
+        Risk analysis is still independent hard gate. Now includes sniper saturation,
+        funding cluster, sale duration penalties for selectivity.
         """
-        # Momentum: 35 points.
+        # Momentum: 35 points - early stage pump.fun typically has 10-20 unique, 10-30 trades
+        # Give more credit for moderate unique wallets
+        unique_score = min(max(self.unique_wallets, 0) / 30.0, 1.0) * 10.0 if self.unique_wallets < 30 else 10.0
+        # Actually keep progressive but with better curve
+        unique_score = min(max(self.unique_wallets, 0) / 50.0, 1.0) * 10.0
+        # Bonus if source is pump portal with observed traders (real data vs snapshot)
+        bonus_unique = 0.0
+        if (self.behavior_data or {}).get("data_quality") == "observed" and self.unique_wallets >= 8:
+            bonus_unique = 3.0
+
         momentum = (
             min(max(self.buy_ratio, 0.0), 1.0) * 15.0
-            + min(max(self.unique_wallets, 0) / 50.0, 1.0) * 10.0
-            + min(max(self.total_trades, 0) / 100.0, 1.0) * 10.0
+            + unique_score
+            + min(max(self.total_trades, 0) / 80.0, 1.0) * 10.0
+            + bonus_unique
         )
+        momentum = min(35.0, momentum)
 
-        # Market quality: 20 points. Unknown developer buy/liquidity does not
-        # receive credit; the separate risk gate must validate missing data.
-        quality = (
-            min(max(self.dev_buy_sol, 0.0) / 2.0, 1.0) * 10.0
-            + min(max(self.liquidity_sol, 0.0) / 50.0, 1.0) * 10.0
-            + min(max(float((self.behavior_data or {}).get("gmgn_quality_score", 0) or 0), 0.0), 10.0)
-        )
+        # Market quality: 30 points now (was 20) – crucial fix for pump.fun where liquidity=0
+        # V2 hotfix: give generous baseline for pump.fun bonding curve
+        behavior = self.behavior_data or {}
+        # Dev buy: 0.5 SOL is decent, give 6 points, 1 SOL gives 12 (capped)
+        dev_score = min(max(self.dev_buy_sol, 0.0) / 1.0, 1.0) * 12.0
 
-        # Opportunity: 25 points, capped at the configured scanner range.
+        liq_score = 0.0
+        if self.liquidity_sol > 0:
+            # For pump.fun, be generous: 30 SOL = full 12 points, 3 SOL = 4 points
+            if self.source in {"pumpfun_new", "pumpfun_api", "logs_subscribe"}:
+                liq_score = max(5.0, min(max(self.liquidity_sol, 0.0) / 25.0, 1.0) * 12.0)
+            else:
+                liq_score = min(max(self.liquidity_sol, 0.0) / 35.0, 1.0) * 10.0
+        else:
+            if self.source in {"pumpfun_new", "pumpfun_api", "logs_subscribe"}:
+                if behavior.get("dev_buy_known") or self.dev_buy_sol >= 0.3:
+                    liq_score = 6.0  # stronger baseline for bonding curve
+                if behavior.get("virtual_sol_reserves"):
+                    try:
+                        vsol = float(behavior.get("virtual_sol_reserves") or 0)
+                        if vsol > 0:
+                            liq_score = max(liq_score, min(vsol / 25.0, 1.0) * 10.0)
+                    except (TypeError, ValueError):
+                        pass
+
+        gmgn_score = min(max(float(behavior.get("gmgn_quality_score", 0) or 0), 0.0), 10.0) * 0.6
+        observed_bonus = 3.0 if behavior.get("data_quality") == "observed" else 0.0
+        # Bonus for having at least 8 unique wallets (real interest)
+        unique_bonus = 2.0 if self.unique_wallets >= 8 else 0.0
+
+        quality = min(30.0, dev_score + liq_score + gmgn_score + observed_bonus + unique_bonus)
+
+        # Opportunity: 25 points, but don't penalize too harsh for low mcap in pump.fun
         market_cap_ratio = min(max(self.market_cap_sol, 0.0) / 50.0, 1.0)
         potential = (1.0 - market_cap_ratio) * 25.0
+        # Soft penalty only for extreme cases
+        if self.market_cap_sol < 0.3 and self.liquidity_sol < 2 and self.source not in {"pumpfun_new", "pumpfun_api", "logs_subscribe"}:
+            potential *= 0.5
+        # Bonus for sweet spot mcap 2-15 SOL (many runners start here) – higher potential zone
+        if 1.5 <= self.market_cap_sol <= 12.0:
+            potential += 3.0
+            potential = min(25.0, potential)
 
-        # Smart-money context: 20 points, deliberately capped.
+        # Social / community bonus – diagnosed higher potential memes often have replies and smart degens
+        social_bonus = 0.0
+        try:
+            reply_count = int((self.behavior_data or {}).get("reply_count") or (self.behavior_data or {}).get("replyCount") or 0)
+            if reply_count >= 10:
+                social_bonus += 2.0
+            elif reply_count >= 5:
+                social_bonus += 1.0
+        except (TypeError, ValueError):
+            pass
+        try:
+            smart_degen = int((self.behavior_data or {}).get("smart_degen_count") or 0)
+            if smart_degen >= 5:
+                social_bonus += 3.0
+            elif smart_degen >= 2:
+                social_bonus += 1.5
+        except (TypeError, ValueError):
+            pass
+        potential = min(28.0, potential + social_bonus)
+
+        # Smart-money context: 20 points, capped
         smart_money = min(20.0, self.kol_mentions * 5.0 + (10.0 if self.is_whale_alert else 0.0))
 
-        # Penalize launch-level behavior only when traces are available.
+        # Enhanced penalties: MELT-inspired
         behavior = self.behavior_data or {}
-        behavior_scores = [
+        # Core manipulation scores
+        core_scores = [
             float(behavior.get("wash_trading_score", 0.0) or 0.0),
             float(behavior.get("bundle_risk_score", 0.0) or 0.0),
             float(behavior.get("mechanicality_score", 0.0) or 0.0),
         ]
-        behavior_penalty = min(20.0, max(behavior_scores, default=0.0) / 100.0 * 20.0)
+        # New selectivity scores
+        extra_scores = [
+            float(behavior.get("sniper_saturation_score", 0.0) or 0.0),
+            float(behavior.get("time_cluster_score", 0.0) or 0.0),
+            float(behavior.get("sale_duration_risk_score", 0.0) or 0.0),
+            float(behavior.get("cluster_risk_score", 0.0) or 0.0),
+            float(behavior.get("funding_cluster_risk", 0.0) or 0.0),
+        ]
+        # Serial deployer penalty
+        serial_penalty = 0.0
+        if behavior.get("is_serial_deployer"):
+            serial_penalty = float(behavior.get("serial_deployer_risk_score", 30.0) or 30.0)
+
+        max_core = max(core_scores, default=0.0)
+        max_extra = max(extra_scores, default=0.0)
+        # Core penalty up to 20, extra up to 15, serial up to 10
+        behavior_penalty = (
+            min(20.0, max_core / 100.0 * 20.0)
+            + min(15.0, max_extra / 100.0 * 15.0)
+            + min(10.0, serial_penalty / 100.0 * 10.0)
+        )
 
         self.momentum_score = momentum
         self.safety_score = quality
